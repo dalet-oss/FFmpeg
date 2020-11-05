@@ -2043,7 +2043,7 @@ fail:
     return ret;
 }
 
-static int recheck_discard_flags(AVFormatContext *s, int first)
+static int recheck_discard_flags(AVFormatContext *s)
 {
     HLSContext *c = s->priv_data;
     int i, changed = 0;
@@ -2070,7 +2070,7 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
                 pls->seek_stream_index = -1;
             }
             av_log(s, AV_LOG_INFO, "Now receiving playlist %d, segment %d\n", i, pls->cur_seq_no);
-        } else if (first && !cur_needed && pls->needed) {
+        } else if (!cur_needed && pls->needed) {
             ff_format_io_close(pls->parent, &pls->input);
             pls->input_read_done = 0;
             ff_format_io_close(pls->parent, &pls->input_next);
@@ -2130,7 +2130,7 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
     HLSContext *c = s->priv_data;
     int ret, i, minplaylist = -1;
 
-    recheck_discard_flags(s, c->first_packet);
+    recheck_discard_flags(s);
     c->first_packet = 0;
 
     for (i = 0; i < c->n_playlists; i++) {
