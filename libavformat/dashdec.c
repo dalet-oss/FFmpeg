@@ -166,6 +166,9 @@ typedef struct DASHContext {
 static int ishttp(char *url)
 {
     const char *proto_name = avio_find_protocol_name(url);
+    if (!proto_name) {
+        return 0;
+    }
     return av_strstart(proto_name, "http", NULL);
 }
 
