@@ -3457,7 +3457,7 @@ static int mxf_read_packet(AVFormatContext *s, AVPacket *pkt)
             klv = mxf->current_klv_data;
             max_data_size = klv.next_klv - pos;
         }
-        if (IS_KLV_KEY(klv.key, mxf_essence_element_key) ||
+        if (mxf_match_uid(klv.key, mxf_essence_element_key, 12) ||
             IS_KLV_KEY(klv.key, mxf_canopus_essence_element_key) ||
             IS_KLV_KEY(klv.key, mxf_avid_essence_element_key)) {
             int body_sid = find_body_sid_by_absolute_offset(mxf, klv.offset);
