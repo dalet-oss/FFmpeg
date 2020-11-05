@@ -27,6 +27,7 @@
 #include "internal.h"
 #include "avio_internal.h"
 #include "dash.h"
+#include "urldecode.h"
 
 #define INITIAL_BUFFER_SIZE 32768
 #define MAX_MANIFEST_SIZE 50 * 1024
@@ -442,8 +443,17 @@ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
     else if (strcmp(proto_name, "file") || !strncmp(url, "file,", 5))
         return AVERROR_INVALIDDATA;
 
+    char *url_to_open = NULL;
+    // decode if necessary and safe to do so
+    if (!strcmp(proto_name, "file") && strrchr(url, '%')) {
+        url_to_open = ff_urldecode(url, 1);
+    }
+
     av_freep(pb);
-    ret = avio_open2(pb, url, AVIO_FLAG_READ, c->interrupt_callback, &tmp);
+    ret = avio_open2(pb, url_to_open ? url_to_open : url, AVIO_FLAG_READ, c->interrupt_callback, &tmp);
+    if (url_to_open) {
+        av_free(url_to_open);
+    }
     if (ret >= 0) {
         // update cookies on http response with setcookies.
         char *new_cookies = NULL;
