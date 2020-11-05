@@ -1722,6 +1722,7 @@ static int open_input(DASHContext *c, struct representation *pls, struct fragmen
     AVDictionary *opts = NULL;
     char *url = NULL;
     int ret = 0;
+    int is_http = 0;
 
     url = av_mallocz(c->max_url_size);
     if (!url) {
@@ -1739,7 +1740,26 @@ static int open_input(DASHContext *c, struct representation *pls, struct fragmen
     ff_make_absolute_url(url, c->max_url_size, c->base_url, seg->url);
     av_log(pls->parent, AV_LOG_VERBOSE, "DASH request for url '%s', offset %"PRId64", playlist %d\n",
            url, seg->url_offset, pls->rep_idx);
-    ret = open_url(pls->parent, &pls->input, url, c->avio_opts, opts, NULL);
+    ret = open_url(pls->parent, &pls->input, url, c->avio_opts, opts, &is_http);
+
+    /* Seek to the requested position. If this was a HTTP request, the offset
+     * should already be where want it to, but this allows e.g. local testing
+     * without a HTTP server.
+     *
+     * This is not done for HTTP at all as avio_seek() does internal bookkeeping
+     * of file offset which is out-of-sync with the actual offset when "offset"
+     * AVOption is used with http protocol, causing the seek to not be a no-op
+     * as would be expected. Wrong offset received from the server will not be
+     * noticed without the call, though.
+     */
+    if (ret == 0 && !is_http && seg->url_offset) {
+        int64_t seekret = avio_seek(pls->input, seg->url_offset, SEEK_SET);
+        if (seekret < 0) {
+            av_log(pls->parent, AV_LOG_ERROR, "Unable to seek to offset %"PRId64" of DASH segment '%s'\n", seg->url_offset, seg->url);
+            ret = seekret;
+            ff_format_io_close(pls->parent, &pls->input);
+        }
+    }
 
 cleanup:
     av_free(url);
