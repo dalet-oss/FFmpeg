@@ -746,17 +746,19 @@ static int resolve_content_path(AVFormatContext *s, const char *url, int *max_ur
     }
 
     tmp_max_url_size = aligned(tmp_max_url_size);
-    text = av_mallocz(tmp_max_url_size);
-    if (!text) {
-        updated = AVERROR(ENOMEM);
-        goto end;
+    if (url[strlen(url) - 1] != '/') {
+        text = av_mallocz(tmp_max_url_size);
+        if (!text) {
+            updated = AVERROR(ENOMEM);
+            goto end;
+        }
+        av_strlcpy(text, url, strlen(url) + 1);
+        tmp = text;
+        while (mpdName = av_strtok(tmp, "/", &tmp)) {
+            size = strlen(mpdName);
+        }
+        av_free(text);
     }
-    av_strlcpy(text, url, strlen(url)+1);
-    tmp = text;
-    while (mpdName = av_strtok(tmp, "/", &tmp))  {
-        size = strlen(mpdName);
-    }
-    av_free(text);
 
     path = av_mallocz(tmp_max_url_size);
     tmp_str = av_mallocz(tmp_max_url_size);
