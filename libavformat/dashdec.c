@@ -30,7 +30,7 @@
 #include "urldecode.h"
 
 #define INITIAL_BUFFER_SIZE 32768
-#define MAX_MANIFEST_SIZE 50 * 1024
+#define MAX_MANIFEST_SIZE 500 * 1024
 #define DEFAULT_MANIFEST_SIZE 8 * 1024
 
 struct fragment {
