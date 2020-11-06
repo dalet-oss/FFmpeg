@@ -1831,7 +1831,7 @@ static int mxf_compute_index_tables(MXFContext *mxf)
             /* assume the first stream's duration is reasonable
              * leave index_duration = 0 on further segments in case we have any (unlikely)
              */
-            t->segments[k]->index_duration = mxf_track->original_duration;
+            t->segments[k]->index_duration = av_rescale_q(mxf_track->original_duration, t->segments[k]->index_edit_rate, mxf_track->edit_rate);
             break;
         }
     }
