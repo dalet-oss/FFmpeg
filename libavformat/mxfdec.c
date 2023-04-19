@@ -236,6 +236,12 @@ typedef struct MXFMCASubDescriptor {
     char *language;
 } MXFMCASubDescriptor;
 
+typedef struct MXFAVCSubDescriptor {
+    MXFMetadataSet meta;
+    UID uid;
+    int max_bit_rate;
+} MXFAVCSubDescriptor;
+
 typedef struct MXFIndexTableSegment {
     MXFMetadataSet meta;
     int edit_unit_byte_count;
@@ -360,6 +366,11 @@ static const uint8_t mxf_mastering_display_uls[4][16] = {
     FF_MXF_MasteringDisplayWhitePointChromaticity,
     FF_MXF_MasteringDisplayMaximumLuminance,
     FF_MXF_MasteringDisplayMinimumLuminance,
+};
+
+static const uint8_t mxf_avc_parameters_prefix[13] = { FF_MXF_AVCParameters_PREFIX };
+static const uint8_t mxf_avc_parameters_uls[1][16] = {
+        FF_MXF_AVCParametersMaximumBitrate,
 };
 
 #define IS_KLV_KEY(x, y) (!memcmp(x, y, sizeof(y)))
@@ -1053,6 +1064,17 @@ static int mxf_read_timecode_component(void *arg, AVIOContext *pb, int tag, int 
     case 0x1503:
         mxf_timecode->drop_frame = avio_r8(pb);
         break;
+    }
+    return 0;
+}
+
+static int mxf_read_avc_sub_descriptor(void *arg, AVIOContext *pb, int tag, int size, UID uid, int64_t klv_offset)
+{
+    MXFAVCSubDescriptor *mxf_avc_sub_descriptor = arg;
+    if (IS_KLV_KEY(uid, mxf_avc_parameters_prefix)) {
+        if (IS_KLV_KEY(uid, mxf_avc_parameters_uls[0])) {
+            mxf_avc_sub_descriptor->max_bit_rate = avio_rb32(pb);
+        }
     }
     return 0;
 }
@@ -2957,6 +2979,13 @@ static int mxf_parse_structural_metadata(MXFContext *mxf)
                     goto fail_and_free;
                 descriptor->coll = NULL;
             }
+
+            for (int i = 0; i < descriptor->sub_descriptors_count; i++) {
+                MXFAVCSubDescriptor *avc = mxf_resolve_strong_ref(mxf, &descriptor->sub_descriptors_refs[i], AVCSubDescriptor);
+                if (avc == NULL)
+                    continue;
+                st->codecpar->bit_rate = avc->max_bit_rate;
+            }
         } else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
             container_ul = mxf_get_codec_ul(mxf_sound_essence_container_uls, essence_container_ul);
             /* Only overwrite existing codec ID if it is unset or A-law, which is the default according to SMPTE RP 224. */
@@ -3215,6 +3244,7 @@ static const MXFMetadataReadTableEntry mxf_metadata_read_table[] = {
     { { 0x06,0x0e,0x2b,0x34,0x02,0x53,0x01,0x01,0x0d,0x01,0x04,0x01,0x02,0x02,0x00,0x00 }, mxf_read_cryptographic_context, sizeof(MXFCryptoContext), CryptoContext },
     { { 0x06,0x0e,0x2b,0x34,0x02,0x53,0x01,0x01,0x0d,0x01,0x02,0x01,0x01,0x10,0x01,0x00 }, mxf_read_index_table_segment, sizeof(MXFIndexTableSegment), IndexTableSegment },
     { { 0x06,0x0e,0x2b,0x34,0x02,0x53,0x01,0x01,0x0d,0x01,0x01,0x01,0x01,0x01,0x23,0x00 }, mxf_read_essence_container_data, sizeof(MXFEssenceContainerData), EssenceContainerData },
+    { { 0x06,0x0e,0x2b,0x34,0x02,0x53,0x01,0x01,0x0d,0x01,0x01,0x01,0x01,0x01,0x6e,0x00 }, mxf_read_avc_sub_descriptor, sizeof(MXFAVCSubDescriptor), AVCSubDescriptor }, /* AVC Sub-Descriptor */
     { { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 }, NULL, 0, AnyType },
 };
 
