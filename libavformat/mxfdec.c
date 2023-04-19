@@ -1516,16 +1516,39 @@ static const MXFCodecUL *mxf_get_codec_ul(const MXFCodecUL *uls, UID *uid)
 static void *mxf_resolve_strong_ref(MXFContext *mxf, UID *strong_ref, enum MXFMetadataSetType type)
 {
     int i;
+    MXFMetadataSet *mxf_metadata_set = NULL;
+    MXFMetadataSet *best_mxf_metadata_set = NULL;
 
+    // if type is Descriptor or Sequence and there are multiple matches, prefer one with duration set
     if (!strong_ref)
         return NULL;
     for (i = mxf->metadata_sets_count - 1; i >= 0; i--) {
         if (!memcmp(*strong_ref, mxf->metadata_sets[i]->uid, 16) &&
             (type == AnyType || mxf->metadata_sets[i]->type == type)) {
-            return mxf->metadata_sets[i];
+            if (type != Descriptor && type != Sequence) {
+                return mxf->metadata_sets[i];
+            }
+            mxf_metadata_set = mxf->metadata_sets[i];
+            if (!best_mxf_metadata_set) {
+                best_mxf_metadata_set = mxf_metadata_set;
+            }
+            else if (type == Descriptor) {
+                MXFDescriptor *mxf_descriptor = (MXFDescriptor *)mxf_metadata_set;
+                MXFDescriptor *best_mxf_descriptor = (MXFDescriptor *)best_mxf_metadata_set;
+                if (best_mxf_descriptor->duration <= 0 && mxf_descriptor->duration > 0) {
+                    best_mxf_metadata_set = mxf_metadata_set;
+                }
+            }
+            else {
+                MXFSequence *mxf_sequence = (MXFSequence *)mxf_metadata_set;
+                MXFSequence *best_mxf_sequence = (MXFSequence *)best_mxf_metadata_set;
+                if (best_mxf_sequence->duration <= 0 && mxf_sequence->duration > 0) {
+                    best_mxf_metadata_set = mxf_metadata_set;
+                }
+            }
         }
     }
-    return NULL;
+    return best_mxf_metadata_set;
 }
 
 static const MXFCodecUL mxf_picture_essence_container_uls[] = {
@@ -2716,13 +2739,25 @@ static int mxf_parse_structural_metadata(MXFContext *mxf)
 
         /* A SourceClip from a EssenceGroup may only be a single frame of essence data. The clips duration is then how many
          * frames its suppose to repeat for. Descriptor->duration, if present, contains the real duration of the essence data */
-        if (descriptor && descriptor->duration != AV_NOPTS_VALUE)
-            source_track->original_duration = st->duration = FFMIN(descriptor->duration, component->duration);
+        if (descriptor && descriptor->duration != AV_NOPTS_VALUE) {
+            if (component->duration > 0) {
+                source_track->original_duration = st->duration = FFMIN(descriptor->duration, component->duration);
+            }
+            else if (descriptor->duration != AV_NOPTS_VALUE) {
+                source_track->original_duration = st->duration = descriptor->duration;
+            }
+        }
         else
             source_track->original_duration = st->duration = component->duration;
 
-        if (st->duration == -1)
-            st->duration = AV_NOPTS_VALUE;
+        if (st->duration == -1) {
+            if (material_track->sequence->duration > 0) {
+                st->duration = material_track->sequence->duration;
+            }
+            else {
+                st->duration = AV_NOPTS_VALUE;
+            }
+        }
         st->start_time = component->start_position;
         if (material_track->edit_rate.num <= 0 ||
             material_track->edit_rate.den <= 0) {
