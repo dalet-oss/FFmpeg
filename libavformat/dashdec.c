@@ -1862,6 +1862,8 @@ restart:
     /* check the v->cur_seg, if it is null, get current and double check if the new v->cur_seg*/
     if (!v->cur_seg) {
         v->cur_seg = get_current_fragment(v);
+        v->cur_seg_size = v->cur_seg->size;
+        v->cur_seg_offset = 0;
     }
     if (!v->cur_seg) {
         ret = AVERROR_EOF;
@@ -1871,6 +1873,11 @@ restart:
     if (ret > 0)
         goto end;
 
+    if (ret == 0) {
+        v->cur_seq_no++;
+        free_fragment(&v->cur_seg);
+        goto restart;
+    }
     if (c->is_live || v->cur_seq_no < v->last_seq_no) {
         if (!v->is_restart_needed)
             v->cur_seq_no++;
