@@ -172,6 +172,76 @@ static int dnxhd_get_profile(int cid)
     return FF_PROFILE_DNXHD;
 }
 
+static unsigned int get_compressed_frame_size(int cid, unsigned int width, unsigned int height, int alpha)
+{
+    unsigned int size = 0;
+    switch (cid)
+    {
+        case 1253:
+        case 1274:
+            size = 188416;
+            break;
+        case 1258:
+            size = 212992;
+            break;
+        case 1252:
+            size = 303104;
+            break;
+        case 1259:
+        case 1260:
+            size = 417792;
+            break;
+        case 1250:
+        case 1251:
+            size = 458752;
+            break;
+        case 1237:
+        case 1242:
+        case 1244:
+        case 1273:
+            size = 606208;
+            break;
+        case 1235:
+        case 1238:
+        case 1241:
+        case 1243:
+        case 1271:
+        case 1272:
+            size = 917504;
+            break;
+        case 1256:
+        case 1270:
+            size = 1835008;
+            break;
+        default:
+            return 0;
+    }
+
+    if (cid >= 1270) {
+        unsigned int block_width = width / 16;
+        if (width % 16)
+            block_width++;
+        unsigned int block_height = height / 16;
+        if (height % 16)
+            block_height++;
+        size *= block_width * block_height;
+        if (alpha)
+            size /= 12240;
+        else
+            size /= 8160;
+
+        unsigned int remaining = size % 4096;
+        if (remaining >= 2048) // round up or down?
+            size += 4096 - remaining;
+        else
+            size -= remaining;
+        if (size < 8192) // lower size limit
+            size = 8192;
+    }
+
+    return size;
+};
+
 static int dnxhd_decode_header(DNXHDContext *ctx, AVFrame *frame,
                                const uint8_t *buf, int buf_size,
                                int first_field)
@@ -344,7 +414,10 @@ static int dnxhd_decode_header(DNXHDContext *ctx, AVFrame *frame,
             return AVERROR_INVALIDDATA;
         }
     }
-
+    if (ctx->avctx->time_base.num > 0) {
+        unsigned int compressed_frame_size = get_compressed_frame_size(ctx->cid_table->cid, ctx->width, ctx->height, ctx->alpha);
+        ctx->avctx->bit_rate = compressed_frame_size * ctx->avctx->time_base.den * 8 / ctx->avctx->time_base.num;
+    }
     return 0;
 }
 
