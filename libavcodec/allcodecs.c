@@ -678,6 +678,7 @@ extern const AVCodec ff_ssa_encoder;
 extern const AVCodec ff_ssa_decoder;
 extern const AVCodec ff_ass_encoder;
 extern const AVCodec ff_ass_decoder;
+extern const AVCodec ff_ccaption708_decoder;
 extern const AVCodec ff_ccaption_decoder;
 extern const AVCodec ff_dvbsub_encoder;
 extern const AVCodec ff_dvbsub_decoder;

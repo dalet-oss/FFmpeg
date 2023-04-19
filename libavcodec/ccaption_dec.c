@@ -945,7 +945,7 @@ static const AVClass ccaption_dec_class = {
 
 const AVCodec ff_ccaption_decoder = {
     .name           = "cc_dec",
-    .long_name      = NULL_IF_CONFIG_SMALL("Closed Caption (EIA-608 / CEA-708)"),
+    .long_name      = NULL_IF_CONFIG_SMALL("Closed Caption (EIA-608)"),
     .type           = AVMEDIA_TYPE_SUBTITLE,
     .id             = AV_CODEC_ID_EIA_608,
     .priv_data_size = sizeof(CCaptionSubContext),
@@ -956,4 +956,19 @@ const AVCodec ff_ccaption_decoder = {
     .priv_class     = &ccaption_dec_class,
     .capabilities   = AV_CODEC_CAP_DELAY,
     .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
+};
+
+AVCodec ff_ccaption708_decoder = {
+        .name           = "cc_dec_708",
+        .long_name      = NULL_IF_CONFIG_SMALL("Closed Caption (CEA-708)"),
+        .type           = AVMEDIA_TYPE_SUBTITLE,
+        .id             = AV_CODEC_ID_EIA_708,
+        .priv_data_size = sizeof(CCaptionSubContext),
+        .init           = init_decoder,
+        .close          = close_decoder,
+        .flush          = flush_decoder,
+        .decode         = decode,
+        .priv_class     = &ccaption_dec_class,
+        .capabilities   = AV_CODEC_CAP_DELAY,
+        .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
 };
