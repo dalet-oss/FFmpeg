@@ -2396,7 +2396,14 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
     }
     /* check if the timestamp is valid for the playlist with the
      * specified stream index */
-    if (!seek_pls || !find_timestamp_in_playlist(c, seek_pls, seek_timestamp, &seq_no))
+    int find_ts_ret = find_timestamp_in_playlist(c, seek_pls, seek_timestamp, &seq_no);
+    // rounding from seek time to timebase and then back to seek time causes rounding
+    // issues. If seek_timestamp is less than first_timestamp, set it to this
+    if (find_ts_ret == 0 && seq_no == seek_pls->start_seq_no && seek_timestamp < first_timestamp) {
+        seek_timestamp = first_timestamp;
+        find_ts_ret = 1;
+    }
+    if (!seek_pls || !find_ts_ret)
         return AVERROR(EIO);
 
     /* set segment now so we do not need to search again below */
