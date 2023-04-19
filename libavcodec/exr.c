@@ -1911,10 +1911,13 @@ static int decode_header(EXRContext *s, AVFrame *frame)
             continue;
         } else if ((var_size = check_header_variable(s, "writer",
                                                      "string", 1)) >= 0) {
-            uint8_t key[256] = { 0 };
+            uint8_t *key = av_malloc(var_size);
 
-            bytestream2_get_buffer(gb, key, FFMIN(sizeof(key) - 1, var_size));
-            av_dict_set(&metadata, "writer", key, 0);
+            if (!key)
+                return AVERROR(ENOMEM);
+
+            bytestream2_get_buffer(gb, key, var_size);
+            av_dict_set(&metadata, "writer", key, AV_DICT_DONT_STRDUP_VAL);
 
             continue;
         } else if ((var_size = check_header_variable(s, "framesPerSecond",
@@ -1936,9 +1939,12 @@ static int decode_header(EXRContext *s, AVFrame *frame)
             continue;
         } else if ((var_size = check_header_variable(s, "type",
                                                      "string", 16)) >= 0) {
-            uint8_t key[256] = { 0 };
+            uint8_t *key = av_malloc(var_size);
 
-            bytestream2_get_buffer(gb, key, FFMIN(sizeof(key) - 1, var_size));
+            if (!key)
+                return AVERROR(ENOMEM);
+
+            bytestream2_get_buffer(gb, key, var_size);
             if (strncmp("scanlineimage", key, var_size) &&
                 strncmp("tiledimage", key, var_size))
                 return AVERROR_PATCHWELCOME;
@@ -1969,7 +1975,6 @@ static int decode_header(EXRContext *s, AVFrame *frame)
         {
             uint8_t name[256] = { 0 };
             uint8_t type[256] = { 0 };
-            uint8_t value[256] = { 0 };
             int i = 0, size;
 
             while (bytestream2_get_bytes_left(gb) > 0 &&
@@ -1986,9 +1991,18 @@ static int decode_header(EXRContext *s, AVFrame *frame)
             bytestream2_skip(gb, 1);
             size = bytestream2_get_le32(gb);
 
-            bytestream2_get_buffer(gb, value, FFMIN(sizeof(value) - 1, size));
-            if (!strcmp(type, "string"))
-                av_dict_set(&metadata, name, value, 0);
+            if (strcmp(type, "string") != 0) {
+                bytestream2_skip(gb, size);
+
+                continue;
+            }
+            uint8_t *value = av_malloc(size);
+
+            if (!value)
+                return AVERROR(ENOMEM);
+
+            bytestream2_get_buffer(gb, value, size);
+            av_dict_set(&metadata, name, value, AV_DICT_DONT_STRDUP_VAL);
         }
     }
 
