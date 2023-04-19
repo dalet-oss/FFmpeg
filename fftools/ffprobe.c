@@ -124,7 +124,7 @@ static int show_private_data            = 1;
 static int show_optional_fields = SHOW_OPTIONAL_FIELDS_AUTO;
 
 static char *print_format;
-static char *stream_specifier;
+static char *stream_specifiers;
 static char *show_data_hash;
 
 typedef struct ReadInterval {
@@ -3279,14 +3279,23 @@ static int probe_file(WriterContext *wctx, const char *filename,
     REALLOCZ_ARRAY_STREAM(selected_streams,0,ifile.fmt_ctx->nb_streams);
 
     for (i = 0; i < ifile.fmt_ctx->nb_streams; i++) {
-        if (stream_specifier) {
-            ret = avformat_match_stream_specifier(ifile.fmt_ctx,
-                                                  ifile.fmt_ctx->streams[i],
-                                                  stream_specifier);
-            CHECK_END;
-            else
-                selected_streams[i] = ret;
-            ret = 0;
+        if (stream_specifiers) {
+            // av_strtok is destructive so we regenerate it in each loop
+            char *tmp_stream_specifiers = av_strdup(stream_specifiers);
+            char *first_subselect = tmp_stream_specifiers;
+            char *next_subselect = NULL;
+            char *stream_specifier = NULL;
+
+            while (stream_specifier = av_strtok(first_subselect, ",", &next_subselect)) {
+                first_subselect = NULL;
+
+                ret = avformat_match_stream_specifier(ifile.fmt_ctx, ifile.fmt_ctx->streams[i], stream_specifier);
+                CHECK_END;
+                else
+                    selected_streams[i] = selected_streams[i] || ret;
+                ret = 0;
+            }
+            av_freep(&tmp_stream_specifiers);
         } else {
             selected_streams[i] = 1;
         }
@@ -3815,7 +3824,7 @@ static const OptionDef real_options[] = {
     { "print_format", OPT_STRING | HAS_ARG, { &print_format },
       "set the output printing format (available formats are: default, compact, csv, flat, ini, json, xml)", "format" },
     { "of", OPT_STRING | HAS_ARG, { &print_format }, "alias for -print_format", "format" },
-    { "select_streams", OPT_STRING | HAS_ARG, { &stream_specifier }, "select the specified streams", "stream_specifier" },
+    { "select_streams", OPT_STRING | HAS_ARG, { &stream_specifiers }, "select the specified streams, multiple stream specifiers can be separated by a comma", "stream_specifier" },
     { "sections", OPT_EXIT, {.func_arg = opt_sections}, "print sections structure and section information, and exit" },
     { "show_data",    OPT_BOOL, { &do_show_data }, "show packets data" },
     { "show_data_hash", OPT_STRING | HAS_ARG, { &show_data_hash }, "show packets data hash" },
