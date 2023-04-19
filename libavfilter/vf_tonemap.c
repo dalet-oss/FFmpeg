@@ -250,7 +250,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
 
     /* load original color space even if pixel format is RGB to compute overbrights */
     s->coeffs = &luma_coefficients[in->colorspace];
-    if (s->desat > 0 && (in->colorspace == AVCOL_SPC_UNSPECIFIED || !s->coeffs)) {
+    if (s->desat > 0 && (in->colorspace == AVCOL_SPC_UNSPECIFIED || !s->coeffs || !s->coeffs->cr)) {
         if (in->colorspace == AVCOL_SPC_UNSPECIFIED)
             av_log(s, AV_LOG_WARNING, "Missing color space information, ");
         else if (!s->coeffs)
