@@ -8231,6 +8231,7 @@ static int mov_read_packet(AVFormatContext *s, AVPacket *pkt)
 
             // Clear current sample
             mov_current_sample_set(msc, 0);
+            msc->ctts_index = 0;
 
             // Discard current index entries
             FFStream *const avsti = ffstream(avst);
