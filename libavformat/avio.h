@@ -334,6 +334,7 @@ const char *avio_find_protocol_name(const char *url);
  * checked resource.
  */
 int avio_check(const char *url, int flags);
+int avio_check2(const char *url, int flags, AVDictionary **options);
 
 /**
  * Open directory for reading.
