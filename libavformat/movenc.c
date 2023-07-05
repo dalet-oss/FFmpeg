@@ -6140,7 +6140,7 @@ int ff_mov_write_packet(AVFormatContext *s, AVPacket *pkt)
         else if (!size)
             goto end;
         avio_write(pb, pkt->data, size);
-    } else if (par->codec_id == AV_CODEC_ID_EIA_608) {
+    } else if (par->codec_id == AV_CODEC_ID_EIA_608 || par->codec_id == AV_CODEC_ID_EIA_708) {
         size = 8;
 
         for (int i = 0; i < pkt->size; i += 3) {
