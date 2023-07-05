@@ -112,7 +112,9 @@ static int is_glob(const char *path)
  * @return -1 if no image file could be found
  */
 static int find_image_range(AVIOContext *pb, int *pfirst_index, int *plast_index,
-                            const char *path, int start_index, int start_index_range)
+                            const char *path, int start_index, int start_index_range, char *cookies,
+                            int reconnect, int reconnect_on_network_error, char *reconnect_on_http_error,
+                            int timeout)
 {
     char buf[1024];
     int range, last_index, range1, first_index;
@@ -122,12 +124,29 @@ static int find_image_range(AVIOContext *pb, int *pfirst_index, int *plast_index
         if (av_get_frame_filename(buf, sizeof(buf), path, first_index) < 0) {
             *pfirst_index =
             *plast_index  = 1;
-            if (pb || avio_check(buf, AVIO_FLAG_READ) > 0)
+            AVDictionary *opts = NULL;
+            av_dict_set(&opts, "cookies", cookies, 0);
+            av_dict_set_int(&opts, "reconnect", reconnect, 0);
+            av_dict_set_int(&opts, "reconnect_on_network_error", reconnect_on_network_error, 0);
+            av_dict_set(&opts, "reconnect_on_http_error", reconnect_on_http_error, 0);
+            av_dict_set_int(&opts, "timeout", timeout, 0);
+
+            if (pb || avio_check2(buf, AVIO_FLAG_READ, &opts) > 0) {
+                av_dict_free(&opts);
                 return 0;
+            }
             return -1;
         }
-        if (avio_check(buf, AVIO_FLAG_READ) > 0)
+        AVDictionary *opts = NULL;
+        av_dict_set(&opts, "cookies", cookies, 0);
+        av_dict_set_int(&opts, "reconnect", reconnect, 0);
+        av_dict_set_int(&opts, "reconnect_on_network_error", reconnect_on_network_error, 0);
+        av_dict_set(&opts, "reconnect_on_http_error", reconnect_on_http_error, 0);
+        av_dict_set_int(&opts, "timeout", timeout, 0);
+        if (avio_check2(buf, AVIO_FLAG_READ, &opts) > 0) {
+            av_dict_free(&opts);
             break;
+        }
     }
     if (first_index == start_index + start_index_range)
         goto fail;
@@ -144,8 +163,17 @@ static int find_image_range(AVIOContext *pb, int *pfirst_index, int *plast_index
             if (av_get_frame_filename(buf, sizeof(buf), path,
                                       last_index + range1) < 0)
                 goto fail;
-            if (avio_check(buf, AVIO_FLAG_READ) <= 0)
+            AVDictionary *opts = NULL;
+            av_dict_set(&opts, "cookies", cookies, 0);
+            av_dict_set_int(&opts, "reconnect", reconnect, 0);
+            av_dict_set_int(&opts, "reconnect_on_network_error", reconnect_on_network_error, 0);
+            av_dict_set(&opts, "reconnect_on_http_error", reconnect_on_http_error, 0);
+            av_dict_set_int(&opts, "timeout", timeout, 0);
+            if (avio_check2(buf, AVIO_FLAG_READ, &opts) <= 0) {
+                av_dict_free(&opts);
                 break;
+            }
+            av_dict_free(&opts);
             range = range1;
             /* just in case... */
             if (range >= (1 << 30))
@@ -278,7 +306,9 @@ int ff_img_read_header(AVFormatContext *s1)
         }
         if ((s->pattern_type == PT_GLOB_SEQUENCE && !s->use_glob) || s->pattern_type == PT_SEQUENCE) {
             if (find_image_range(s1->pb, &first_index, &last_index, s->path,
-                                 s->start_number, s->start_number_range) < 0) {
+                                 s->start_number, s->start_number_range, s->cookies,
+                                 s->reconnect, s->reconnect_on_network_error, s->reconnect_on_http_error,
+                                 s->timeout) < 0) {
                 av_log(s1, AV_LOG_ERROR,
                        "Could find no file with path '%s' and index in the range %d-%d\n",
                        s->path, s->start_number, s->start_number + s->start_number_range - 1);
@@ -436,18 +466,27 @@ int ff_img_read_packet(AVFormatContext *s1, AVPacket *pkt)
             return AVERROR(EIO);
         }
         for (i = 0; i < 3; i++) {
+            AVDictionary *opts = NULL;
+            av_dict_set(&opts, "cookies", s->cookies, 0);
+            av_dict_set_int(&opts, "reconnect", s->reconnect, 0);
+            av_dict_set_int(&opts, "reconnect_on_network_error", s->reconnect_on_network_error, 0);
+            av_dict_set(&opts, "reconnect_on_http_error", s->reconnect_on_http_error, 0);
+            av_dict_set_int(&opts, "timeout", s->timeout, 0);
+
             if (s1->pb &&
                 !strcmp(filename_bytes, s->path) &&
                 !s->loop &&
                 !s->split_planes) {
                 f[i] = s1->pb;
-            } else if (s1->io_open(s1, &f[i], filename, AVIO_FLAG_READ, NULL) < 0) {
+            } else if (s1->io_open(s1, &f[i], filename, AVIO_FLAG_READ, &opts) < 0) {
+                av_dict_free(&opts);
                 if (i >= 1)
                     break;
                 av_log(s1, AV_LOG_ERROR, "Could not open file : %s\n",
                        filename);
                 return AVERROR(EIO);
             }
+            av_dict_free(&opts);
             size[i] = avio_size(f[i]);
 
             if (!s->split_planes)
@@ -628,6 +667,11 @@ const AVOption ff_img_options[] = {
     { "sec",  "second precision",       0, AV_OPT_TYPE_CONST,    {.i64 = 1   }, 0, 2,       DEC, "ts_type" },
     { "ns",   "nano second precision",  0, AV_OPT_TYPE_CONST,    {.i64 = 2   }, 0, 2,       DEC, "ts_type" },
     { "export_path_metadata", "enable metadata containing input path information", OFFSET(export_path_metadata), AV_OPT_TYPE_BOOL,   {.i64 = 0   }, 0, 1,       DEC }, \
+    { "cookies", "set cookies to be sent in applicable future requests, use newline delimited Set-Cookie HTTP field value syntax", OFFSET(cookies), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, DEC },
+    { "reconnect", "auto reconnect after disconnect before EOF", OFFSET(reconnect), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, DEC },
+    { "reconnect_on_network_error", "auto reconnect in case of tcp/tls error during connect", OFFSET(reconnect_on_network_error), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, DEC },
+    { "reconnect_on_http_error", "list of http status codes to reconnect on. the list can include specific status codes / 4xx / 5xx", OFFSET(reconnect_on_http_error), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, DEC },
+    { "timeout", "set timeout (in microseconds) of socket I/O operations", OFFSET(timeout), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, INT_MAX, DEC },
     COMMON_OPTIONS
 };
 
