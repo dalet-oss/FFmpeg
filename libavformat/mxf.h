@@ -101,6 +101,9 @@ extern const uint8_t ff_mxf_random_index_pack_key[16];
 #define FF_MXF_MASTERING_CHROMA_DEN 50000
 #define FF_MXF_MASTERING_LUMA_DEN   10000
 
+#define FF_MXF_AVCParameters_PREFIX                     0x06,0x0e,0x2b,0x34,0x01,0x01,0x01,0x0e,0x04,0x01,0x06,0x06,0x01
+#define FF_MXF_AVCParametersMaximumBitrate              { FF_MXF_AVCParameters_PREFIX,0x0b,0x00,0x00 }
+
 typedef struct MXFCodecUL {
     UID uid;
     unsigned matching_len;
