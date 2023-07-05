@@ -207,12 +207,12 @@ static uint64_t get_utc_date_time_insec(AVFormatContext *s, const char *datetime
     return av_timegm(&timeinfo);
 }
 
-static uint32_t get_duration(AVFormatContext *s, const char *duration, int inMicroseconds)
+static uint64_t get_duration(AVFormatContext *s, const char *duration, int inMicroseconds)
 {
     /* ISO-8601 duration parser */
-    uint32_t days = 0;
-    uint32_t hours = 0;
-    uint32_t mins = 0;
+    uint64_t days = 0;
+    uint64_t hours = 0;
+    uint64_t mins = 0;
     float secs = 0;
     int size = 0;
     float value = 0;
@@ -231,13 +231,13 @@ static uint32_t get_duration(AVFormatContext *s, const char *duration, int inMic
         }
         switch (type) {
         case 'D':
-            days = (uint32_t)value;
+            days = (uint64_t)value;
             break;
         case 'H':
-            hours = (uint32_t)value;
+            hours = (uint64_t)value;
             break;
         case 'M':
-            mins = (uint32_t)value;
+            mins = (uint64_t)value;
             break;
         case 'S':
             secs = value;
@@ -249,17 +249,17 @@ static uint32_t get_duration(AVFormatContext *s, const char *duration, int inMic
         ptr += size;
     }
     if (inMicroseconds) {
-        return  (((days * 24 + hours) * 60 + mins) * 60 * AV_TIME_BASE) + (uint32_t)(secs * AV_TIME_BASE);
+        return  (((days * 24 + hours) * 60 + mins) * 60 * AV_TIME_BASE) + (uint64_t)(secs * AV_TIME_BASE);
     }
-    return  ((days * 24 + hours) * 60 + mins) * 60 + (uint32_t)secs;
+    return  ((days * 24 + hours) * 60 + mins) * 60 + (uint64_t)secs;
 }
 
-static uint32_t get_duration_inmicrosec(AVFormatContext *s, const char *duration)
+static uint64_t get_duration_inmicrosec(AVFormatContext *s, const char *duration)
 {
     return get_duration(s, duration, 1);
 }
 
-static uint32_t get_duration_insec(AVFormatContext *s, const char *duration)
+static uint64_t get_duration_insec(AVFormatContext *s, const char *duration)
 {
     return get_duration(s, duration, 0);
 }
@@ -1256,8 +1256,8 @@ static int parse_manifest(AVFormatContext *s, const char *url, AVIOContext *in)
     xmlNodePtr adaptionset_node = NULL;
     xmlAttrPtr attr = NULL;
     char *val  = NULL;
-    uint32_t period_duration_sec = 0;
-    uint32_t period_start_sec = 0;
+    uint64_t period_duration_sec = 0;
+    uint64_t period_start_sec = 0;
 
     if (!in) {
         close_in = 1;
