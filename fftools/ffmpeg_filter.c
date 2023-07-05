@@ -527,13 +527,17 @@ static int insert_trim(int64_t start_time, int64_t duration,
     if (!ctx)
         return AVERROR(ENOMEM);
 
-    if (duration != INT64_MAX) {
-        ret = av_opt_set_int(ctx, "durationi", duration,
-                                AV_OPT_SEARCH_CHILDREN);
-    }
-    if (ret >= 0 && start_time != AV_NOPTS_VALUE) {
+    if (start_time != AV_NOPTS_VALUE) {
         ret = av_opt_set_int(ctx, "starti", start_time,
-                                AV_OPT_SEARCH_CHILDREN);
+                             AV_OPT_SEARCH_CHILDREN);
+    }
+    if (ret >= 0 && duration != INT64_MAX) {
+        int64_t end = duration;
+        if (start_time != AV_NOPTS_VALUE) {
+            end += start_time;
+        }
+        ret = av_opt_set_int(ctx, "endi", end,
+                             AV_OPT_SEARCH_CHILDREN);
     }
     if (ret < 0) {
         av_log(ctx, AV_LOG_ERROR, "Error configuring the %s filter", name);
