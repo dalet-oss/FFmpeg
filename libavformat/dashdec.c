@@ -130,7 +130,7 @@ typedef struct DASHContext {
     struct representation **subtitles;
 
     /* MediaPresentationDescription Attribute */
-    uint64_t media_presentation_duration;
+    uint64_t media_presentation_duration; // in microseconds
     uint64_t suggested_presentation_delay;
     uint64_t availability_start_time;
     uint64_t availability_end_time;
@@ -206,13 +206,13 @@ static uint64_t get_utc_date_time_insec(AVFormatContext *s, const char *datetime
     return av_timegm(&timeinfo);
 }
 
-static uint32_t get_duration_insec(AVFormatContext *s, const char *duration)
+static uint32_t get_duration(AVFormatContext *s, const char *duration, int inMicroseconds)
 {
     /* ISO-8601 duration parser */
     uint32_t days = 0;
     uint32_t hours = 0;
     uint32_t mins = 0;
-    uint32_t secs = 0;
+    float secs = 0;
     int size = 0;
     float value = 0;
     char type = '\0';
@@ -239,7 +239,7 @@ static uint32_t get_duration_insec(AVFormatContext *s, const char *duration)
             mins = (uint32_t)value;
             break;
         case 'S':
-            secs = (uint32_t)value;
+            secs = value;
             break;
         default:
             // handle invalid type
@@ -247,7 +247,20 @@ static uint32_t get_duration_insec(AVFormatContext *s, const char *duration)
         }
         ptr += size;
     }
-    return  ((days * 24 + hours) * 60 + mins) * 60 + secs;
+    if (inMicroseconds) {
+        return  (((days * 24 + hours) * 60 + mins) * 60 * AV_TIME_BASE) + (uint32_t)(secs * AV_TIME_BASE);
+    }
+    return  ((days * 24 + hours) * 60 + mins) * 60 + (uint32_t)secs;
+}
+
+static uint32_t get_duration_inmicrosec(AVFormatContext *s, const char *duration)
+{
+    return get_duration(s, duration, 1);
+}
+
+static uint32_t get_duration_insec(AVFormatContext *s, const char *duration)
+{
+    return get_duration(s, duration, 0);
 }
 
 static int64_t get_segment_start_time_based_on_timeline(struct representation *pls, int64_t cur_seq_no)
@@ -1309,7 +1322,7 @@ static int parse_manifest(AVFormatContext *s, const char *url, AVIOContext *in)
                 c->suggested_presentation_delay = get_duration_insec(s, val);
                 av_log(s, AV_LOG_TRACE, "c->suggested_presentation_delay = [%"PRId64"]\n", c->suggested_presentation_delay);
             } else if (!av_strcasecmp(attr->name, "mediaPresentationDuration")) {
-                c->media_presentation_duration = get_duration_insec(s, val);
+                c->media_presentation_duration = get_duration_inmicrosec(s, val);
                 av_log(s, AV_LOG_TRACE, "c->media_presentation_duration = [%"PRId64"]\n", c->media_presentation_duration);
             }
             attr = attr->next;
@@ -1345,7 +1358,7 @@ static int parse_manifest(AVFormatContext *s, const char *url, AVIOContext *in)
                     c->period_duration = period_duration_sec;
                     c->period_start = period_start_sec;
                     if (c->period_start > 0)
-                        c->media_presentation_duration = c->period_duration;
+                        c->media_presentation_duration = c->period_duration * AV_TIME_BASE;
                 }
             } else if (!av_strcasecmp(node->name, "ProgramInformation")) {
                 parse_programinformation(s, node);
@@ -1457,7 +1470,7 @@ static int64_t calc_max_seg_no(struct representation *pls, DASHContext *c)
     } else if (c->is_live && pls->fragment_duration) {
         num = pls->first_seq_no + (((get_current_time_in_sec() - c->availability_start_time)) * pls->fragment_timescale)  / pls->fragment_duration;
     } else if (pls->fragment_duration) {
-        num = pls->first_seq_no + av_rescale_rnd(1, c->media_presentation_duration * pls->fragment_timescale, pls->fragment_duration, AV_ROUND_UP);
+        num = pls->first_seq_no + av_rescale_rnd(1, (c->media_presentation_duration / AV_TIME_BASE) * pls->fragment_timescale, pls->fragment_duration, AV_ROUND_UP);
     }
 
     return num;
@@ -2075,7 +2088,7 @@ static int dash_read_header(AVFormatContext *s)
     /* If this isn't a live stream, fill the total duration of the
      * stream. */
     if (!c->is_live) {
-        s->duration = (int64_t) c->media_presentation_duration * AV_TIME_BASE;
+        s->duration = (int64_t) c->media_presentation_duration;
     } else {
         av_dict_set(&c->avio_opts, "seekable", "0", 0);
     }
