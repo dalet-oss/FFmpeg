@@ -2919,7 +2919,10 @@ static int read_interval_packets(WriterContext *w, InputFile *ifile,
     for (i = 0; i < ifile->nb_streams; i++) {
         pkt->stream_index = i;
         if (do_read_frames) {
-            while (process_frame(w, ifile, frame, pkt, &(int){1}) > 0);
+            int new_packet = 1;
+            while (process_frame(w, ifile, frame, pkt, &new_packet) > 0) {
+                new_packet = 0;
+            }
             if (ifile->streams[i].dec_ctx)
                 avcodec_flush_buffers(ifile->streams[i].dec_ctx);
         }
