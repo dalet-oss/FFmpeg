@@ -946,11 +946,25 @@ static const AVClass ccaption_dec_class = {
 
 const FFCodec ff_ccaption_decoder = {
     .p.name         = "cc_dec",
-    CODEC_LONG_NAME("Closed Caption (EIA-608 / CEA-708)"),
+    CODEC_LONG_NAME("Closed Caption (EIA-608)"),
     .p.type         = AVMEDIA_TYPE_SUBTITLE,
     .p.id           = AV_CODEC_ID_EIA_608,
     .p.priv_class   = &ccaption_dec_class,
     .p.capabilities = AV_CODEC_CAP_DELAY,
+    .priv_data_size = sizeof(CCaptionSubContext),
+    .init           = init_decoder,
+    .close          = close_decoder,
+    .flush          = flush_decoder,
+    FF_CODEC_DECODE_SUB_CB(decode),
+};
+
+const FFCodec ff_ccaption708_decoder = {
+    .p.name           = "cc_dec_708",
+    CODEC_LONG_NAME("Closed Caption (EIA-708)"),
+    .p.type           = AVMEDIA_TYPE_SUBTITLE,
+    .p.id             = AV_CODEC_ID_EIA_708,
+    .p.priv_class     = &ccaption_dec_class,
+    .p.capabilities   = AV_CODEC_CAP_DELAY,
     .priv_data_size = sizeof(CCaptionSubContext),
     .init           = init_decoder,
     .close          = close_decoder,
