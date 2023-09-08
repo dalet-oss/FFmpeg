@@ -324,6 +324,7 @@ typedef struct MXFContext {
     int nb_index_tables;
     MXFIndexTable *index_tables;
     int eia608_extract;
+    int skip_essence_parse;
 } MXFContext;
 
 /* NOTE: klv_offset is not set (-1) for local keys */
@@ -3466,6 +3467,9 @@ static int mxf_seek_to_previous_partition(MXFContext *mxf)
     int64_t current_partition_ofs;
     int ret;
 
+    if (mxf->skip_essence_parse)
+        return 0;
+
     if (!mxf->current_partition ||
         mxf->run_in + mxf->current_partition->previous_partition <= mxf->last_forward_tell)
         return 0;   /* we've parsed all partitions */
@@ -4046,6 +4050,7 @@ static int mxf_read_packet(AVFormatContext *s, AVPacket *pkt)
     KLVPacket klv;
     MXFContext *mxf = s->priv_data;
     int ret;
+    av_log(s, AV_LOG_ERROR, "mxf_read_packet\n");
 
     while (1) {
         int64_t max_data_size;
@@ -4341,6 +4346,9 @@ static int mxf_read_seek(AVFormatContext *s, int stream_index, int64_t sample_ti
 static const AVOption options[] = {
     { "eia608_extract", "extract eia 608 captions from s436m track",
       offsetof(MXFContext, eia608_extract), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1,
+      AV_OPT_FLAG_DECODING_PARAM },
+    { "skip_essence_parse", "skip_essence_parse",
+      offsetof(MXFContext, skip_essence_parse), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1,
       AV_OPT_FLAG_DECODING_PARAM },
     { NULL },
 };
