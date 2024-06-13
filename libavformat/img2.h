@@ -62,6 +62,11 @@ typedef struct VideoDemuxData {
     int frame_size;
     int ts_from_file;
     int export_path_metadata; /**< enabled when set to 1. */
+    char *cookies;          ///< holds newline (\n) delimited Set-Cookie header field values (without the "Set-Cookie: " field name)
+    int reconnect;
+    int reconnect_on_network_error;
+    char *reconnect_on_http_error;
+    int timeout;
 } VideoDemuxData;
 
 typedef struct IdStrMap {
