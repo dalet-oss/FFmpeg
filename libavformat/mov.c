@@ -9933,8 +9933,39 @@ static int mov_read_packet(AVFormatContext *s, AVPacket *pkt)
     AVStream *st = NULL;
     int64_t current_index;
     int ret;
+    int i;
     mov->fc = s;
  retry:
+    if (s->pb->pos == 0) {
+
+        // Discard current fragment index
+        if (mov->frag_index.allocated_size > 0) {
+            av_freep(&mov->frag_index.item);
+            mov->frag_index.nb_items = 0;
+            mov->frag_index.allocated_size = 0;
+            mov->frag_index.current = -1;
+            mov->frag_index.complete = 0;
+        }
+
+        for (i = 0; i < s->nb_streams; i++) {
+            AVStream *avst = s->streams[i];
+            MOVStreamContext *msc = avst->priv_data;
+
+            // Clear current sample
+            mov_current_sample_set(msc, 0);
+
+            // Discard current index entries
+            FFStream *const avsti = ffstream(avst);
+            if (avsti->index_entries_allocated_size > 0) {
+                av_freep(&avsti->index_entries);
+                avsti->index_entries_allocated_size = 0;
+                avsti->nb_index_entries = 0;
+            }
+        }
+
+        if ((ret = mov_switch_root(s, -1, -1)) < 0)
+            return ret;
+    }
     sample = mov_find_next_sample(s, &st);
     if (!sample || (mov->next_root_atom && sample->pos > mov->next_root_atom)) {
         if (!mov->next_root_atom)
