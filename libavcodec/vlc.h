@@ -22,7 +22,7 @@
 #include <stdint.h>
 
 // When changing this, be sure to also update tableprint_vlc.h accordingly.
-typedef int16_t VLCBaseType;
+typedef int32_t VLCBaseType;
 
 typedef struct VLCElem {
     VLCBaseType sym, len;
