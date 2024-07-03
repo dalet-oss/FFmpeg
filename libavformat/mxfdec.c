@@ -1289,7 +1289,10 @@ static int mxf_read_index_table_segment(void *arg, AVIOContext *pb, int tag, int
     case 0x3F0B:
         segment->index_edit_rate.num = avio_rb32(pb);
         segment->index_edit_rate.den = avio_rb32(pb);
-        if (segment->index_edit_rate.num <= 0 ||
+        if ((segment->index_edit_rate.num == 0 && segment->index_edit_rate.den == 0)) {
+            segment->index_edit_rate.den = 1;
+        }
+        else if (segment->index_edit_rate.num <= 0 ||
             segment->index_edit_rate.den <= 0)
             return AVERROR_INVALIDDATA;
         av_log(NULL, AV_LOG_TRACE, "IndexEditRate %d/%d\n", segment->index_edit_rate.num,
