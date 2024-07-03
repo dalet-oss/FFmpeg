@@ -2582,7 +2582,7 @@ static int parse_mca_labels(MXFContext *mxf, MXFTrack *source_track, MXFDescript
         for (const MXFChannelOrderingUL* channel_ordering = mxf_channel_ordering; channel_ordering->uid[0]; channel_ordering++) {
             if (IS_KLV_KEY(channel_ordering->uid, label->mca_label_dictionary_id)) {
                 int target_channel = label->mca_channel_id;
-                if (target_channel == 0)
+                if (target_channel == 0 && descriptor->channels == 1)
                     target_channel = 1;
                 if (target_channel <= 0 || target_channel > descriptor->channels) {
                     av_log(mxf->fc, AV_LOG_ERROR, "AudioChannelLabelSubDescriptor has invalid MCA channel ID %d\n", target_channel);
