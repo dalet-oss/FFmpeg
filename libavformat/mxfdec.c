@@ -2564,6 +2564,7 @@ static int parse_mca_labels(MXFContext *mxf, MXFTrack *source_track, MXFDescript
     enum AVAudioServiceType service_type = AV_AUDIO_SERVICE_TYPE_NB;
     int ambigous_service_type = 0;
     int ret;
+    int channel_descriptors_invalid = 0;
 
     for (int i = 0; i < descriptor->sub_descriptors_count; i++) {
         char *channel_language;
@@ -2582,8 +2583,12 @@ static int parse_mca_labels(MXFContext *mxf, MXFTrack *source_track, MXFDescript
         for (const MXFChannelOrderingUL* channel_ordering = mxf_channel_ordering; channel_ordering->uid[0]; channel_ordering++) {
             if (IS_KLV_KEY(channel_ordering->uid, label->mca_label_dictionary_id)) {
                 int target_channel = label->mca_channel_id;
-                if (target_channel == 0 && descriptor->channels == 1)
+                if (target_channel == 0) {
+                    if (descriptor->channels > 1) {
+                        channel_descriptors_invalid = 1;
+                    }
                     target_channel = 1;
+                }
                 if (target_channel <= 0 || target_channel > descriptor->channels) {
                     av_log(mxf->fc, AV_LOG_ERROR, "AudioChannelLabelSubDescriptor has invalid MCA channel ID %d\n", target_channel);
                     return AVERROR_INVALIDDATA;
@@ -2636,7 +2641,7 @@ static int parse_mca_labels(MXFContext *mxf, MXFTrack *source_track, MXFDescript
         *ast = service_type;
     }
 
-    ret = av_channel_layout_retype(ch_layout, 0, AV_CHANNEL_LAYOUT_RETYPE_FLAG_CANONICAL);
+    ret = av_channel_layout_retype(ch_layout, 0, channel_descriptors_invalid ? 0 : AV_CHANNEL_LAYOUT_RETYPE_FLAG_CANONICAL);
     if (ret < 0)
         return ret;
 
