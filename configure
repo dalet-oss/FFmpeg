@@ -335,7 +335,6 @@ External library support:
   --enable-vapoursynth     enable VapourSynth demuxer [no]
   --disable-xlib           disable xlib [autodetect]
   --disable-zlib           disable zlib [autodetect]
-  --enable-libredc         enable R3D file demux and video/audio decoding via libredc [no]
 
   The following libraries provide various hardware acceleration features:
   --disable-amf            disable AMF video encoding code [autodetect]
@@ -1878,7 +1877,6 @@ EXTERNAL_LIBRARY_NONFREE_LIST="
     libfdk_aac
     libtls
     libkakaduc
-    libredc
 "
 
 EXTERNAL_LIBRARY_VERSION3_LIST="
@@ -3123,8 +3121,6 @@ zlib_decoder_select="inflate_wrapper"
 zlib_encoder_select="deflate_wrapper"
 zmbv_decoder_select="inflate_wrapper"
 zmbv_encoder_select="deflate_wrapper"
-libredcvideo_decoder_deps="libredc"
-libredcaudio_decoder_deps="libredc"
 
 # hardware accelerators
 cuda_deps="ffnvcodec"
@@ -3666,7 +3662,6 @@ wtv_demuxer_select="mpegts_demuxer riffdec"
 wtv_muxer_select="mpegts_muxer riffenc"
 xmv_demuxer_select="riffdec"
 xwma_demuxer_select="riffdec"
-libredc_demuxer_select="libredc"
 
 # indevs / outdevs
 android_camera_indev_deps="android camera2ndk mediandk pthreads"
@@ -6882,7 +6877,6 @@ enabled libjxl            && require_pkg_config libjxl "libjxl >= 0.7.0" jxl/dec
 enabled libklvanc         && require libklvanc libklvanc/vanc.h klvanc_context_create -lklvanc
 enabled libkvazaar        && require_pkg_config libkvazaar "kvazaar >= 2.0.0" kvazaar.h kvz_api_get
 enabled liblensfun        && require_pkg_config liblensfun lensfun lensfun.h lf_db_create
-enabled libredc           && require_headers redsdk_c_wrapper.h
 
 if enabled libmfx && enabled libvpl; then
    die "ERROR: can not use libmfx and libvpl together"

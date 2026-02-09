@@ -572,10 +572,6 @@ extern const FFInputFormat  ff_libgme_demuxer;
 extern const FFInputFormat  ff_libmodplug_demuxer;
 extern const FFInputFormat  ff_libopenmpt_demuxer;
 extern const FFInputFormat  ff_vapoursynth_demuxer;
-#if CONFIG_LIBREDC
-#include "redsdk_c_wrapper.h"
-extern const FFInputFormat ff_libredc_demuxer;
-#endif
 
 #include "libavformat/muxer_list.c"
 #include "libavformat/demuxer_list.c"
