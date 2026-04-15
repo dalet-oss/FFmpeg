@@ -8750,12 +8750,17 @@ static int mov_probe(const AVProbeData *p)
         case MKTAG('p','n','o','t'): /* detect movs with preview pics like ew.mov and april.mov */
         case MKTAG('u','d','t','a'): /* Packet Video PVAuthor adds this and a lot of more junk */
         case MKTAG('f','t','y','p'):
-            if (tag == MKTAG('f','t','y','p') &&
-                       (   AV_RL32(p->buf + offset + 8) == MKTAG('j','p','2',' ')
+            if (tag == MKTAG('f','t','y','p')) {
+				if (AV_RL32(p->buf + offset + 8) == MKTAG('j','p','2',' ')
                         || AV_RL32(p->buf + offset + 8) == MKTAG('j','p','x',' ')
                         || AV_RL32(p->buf + offset + 8) == MKTAG('j','x','l',' ')
-                    )) {
-                score = FFMAX(score, 5);
+                    ) {
+                	score = FFMAX(score, 5);
+				} else if (AV_RL32(p->buf + offset + 8) == MKTAG('n','i','k','o')) {
+ 					/* low score to allow libredc to handle it instead of mov,
+					but still allow mov to handle it if libredc is not available */
+					return AVPROBE_SCORE_MAX - 50;
+				}
             } else {
                 score = AVPROBE_SCORE_MAX;
             }
