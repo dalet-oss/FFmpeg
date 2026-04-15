@@ -417,10 +417,6 @@ extern const FFCodec ff_zlib_encoder;
 extern const FFCodec ff_zlib_decoder;
 extern const FFCodec ff_zmbv_encoder;
 extern const FFCodec ff_zmbv_decoder;
-#if CONFIG_LIBREDC
-#include "redsdk_c_wrapper.h"
-extern const FFCodec ff_libredcvideo_decoder;
-#endif
 
 /* audio codecs */
 extern const FFCodec ff_aac_encoder;
@@ -555,10 +551,6 @@ extern const FFCodec ff_wmavoice_decoder;
 extern const FFCodec ff_ws_snd1_decoder;
 extern const FFCodec ff_xma1_decoder;
 extern const FFCodec ff_xma2_decoder;
-#if CONFIG_LIBREDC
-#include "redsdk_c_wrapper.h"
-extern const FFCodec ff_libredcaudio_decoder;
-#endif
 
 /* PCM codecs */
 extern const FFCodec ff_pcm_alaw_encoder;
