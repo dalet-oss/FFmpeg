@@ -28,6 +28,7 @@
 #include "libavutil/parseutils.h"
 #include "internal.h"
 #include "avio_internal.h"
+#include "urldecode.h"
 #include "dash.h"
 #include "demux.h"
 #include "url.h"
@@ -409,6 +410,7 @@ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
 {
     DASHContext *c = s->priv_data;
     AVDictionary *tmp = NULL;
+    char *url_to_open = NULL;
     const char *proto_name = NULL;
     int proto_name_len;
     int ret;
@@ -449,7 +451,14 @@ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
     av_freep(pb);
     av_dict_copy(&tmp, *opts, 0);
     av_dict_copy(&tmp, opts2, 0);
-    ret = s->io_open(s, pb, url, AVIO_FLAG_READ, &tmp);
+    // decode URL if necessary and safe to do so
+    if (!strcmp(proto_name, "file") && strrchr(url, '%')) {
+        url_to_open = ff_urldecode(url, 1);
+    }
+    ret = s->io_open(s, pb, url_to_open ? url_to_open : url, AVIO_FLAG_READ, &tmp);
+    if (url_to_open) {
+        av_free(url_to_open);
+    }
     if (ret >= 0) {
         // update cookies on http response with setcookies.
         char *new_cookies = NULL;
