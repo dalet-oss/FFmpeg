@@ -95,10 +95,13 @@ static int infer_size(int *width_ptr, int *height_ptr, int size)
  * @return -1 if no image file could be found
  */
 static int find_image_range(int *pfirst_index, int *plast_index,
-                            const char *path, int start_index, int start_index_range)
+                            const char *path, int start_index, int start_index_range, char *cookies,
+                            int reconnect, int reconnect_on_network_error, char *reconnect_on_http_error,
+                            int timeout)
 {
     int range, last_index, range1, first_index, ret;
     AVBPrint filename;
+    AVDictionary *opts = NULL;
 
     av_bprint_init(&filename, 0, AV_BPRINT_SIZE_UNLIMITED);
     /* find the first image */
@@ -107,8 +110,16 @@ static int find_image_range(int *pfirst_index, int *plast_index,
         ret = ff_bprint_get_frame_filename(&filename, path, first_index, 0);
         if (ret < 0)
             goto fail;
-        if (avio_check(filename.str, AVIO_FLAG_READ) > 0)
+        av_dict_set(&opts, "cookies", cookies, 0);
+        av_dict_set_int(&opts, "reconnect", reconnect, 0);
+        av_dict_set_int(&opts, "reconnect_on_network_error", reconnect_on_network_error, 0);
+        av_dict_set(&opts, "reconnect_on_http_error", reconnect_on_http_error, 0);
+        av_dict_set_int(&opts, "timeout", timeout, 0);
+        if (avio_check2(filename.str, AVIO_FLAG_READ, &opts) > 0) {
+            av_dict_free(&opts);
             break;
+        }
+        av_dict_free(&opts);
     }
     if (first_index == start_index + start_index_range) {
         ret = AVERROR(EINVAL);
@@ -128,8 +139,16 @@ static int find_image_range(int *pfirst_index, int *plast_index,
             ret = ff_bprint_get_frame_filename(&filename, path, last_index + range1, 0);
             if (ret < 0)
                 goto fail;
-            if (avio_check(filename.str, AVIO_FLAG_READ) <= 0)
+            av_dict_set(&opts, "cookies", cookies, 0);
+            av_dict_set_int(&opts, "reconnect", reconnect, 0);
+            av_dict_set_int(&opts, "reconnect_on_network_error", reconnect_on_network_error, 0);
+            av_dict_set(&opts, "reconnect_on_http_error", reconnect_on_http_error, 0);
+            av_dict_set_int(&opts, "timeout", timeout, 0);
+            if (avio_check2(filename.str, AVIO_FLAG_READ, &opts) <= 0) {
                 break;
+                av_dict_free(&opts);
+            }
+            av_dict_free(&opts);
             range = range1;
             /* just in case... */
             if (range >= (1 << 30)) {
@@ -172,6 +191,7 @@ int ff_img_read_header(AVFormatContext *s1)
     VideoDemuxData *s = s1->priv_data;
     int first_index = 1, last_index = 1;
     AVStream *st;
+    AVDictionary *opts = NULL;
     enum AVPixelFormat pix_fmt = AV_PIX_FMT_NONE;
 
     s1->ctx_flags |= AVFMTCTX_NOHEADER;
@@ -226,16 +246,27 @@ int ff_img_read_header(AVFormatContext *s1)
         }
         if (s->pattern_type == PT_SEQUENCE) {
             if (find_image_range(&first_index, &last_index, s1->url,
-                                 s->start_number, s->start_number_range) < 0) {
-                if (s1->pb || avio_check(s1->url, AVIO_FLAG_READ) > 0) {
+                s->start_number, s->start_number_range, s->cookies,
+                s->reconnect, s->reconnect_on_network_error, s->reconnect_on_http_error,
+                s->timeout) < 0) {
+
+                av_dict_set(&opts, "cookies", s->cookies, 0);
+                av_dict_set_int(&opts, "reconnect", s->reconnect, 0);
+                av_dict_set_int(&opts, "reconnect_on_network_error", s->reconnect_on_network_error, 0);
+                av_dict_set(&opts, "reconnect_on_http_error", s->reconnect_on_http_error, 0);
+                av_dict_set_int(&opts, "timeout", s->timeout, 0);
+
+                if (s1->pb || avio_check2(s1->url, AVIO_FLAG_READ, &opts) > 0) {
                     // Fallback to normal mode
                     s->pattern_type = PT_NONE;
                 } else {
+                    av_dict_free(&opts);
                     av_log(s1, AV_LOG_ERROR,
                            "Could find no file or sequence with path '%s' and index in the range %d-%d\n",
                            s1->url, s->start_number, s->start_number + s->start_number_range - 1);
                     return AVERROR(ENOENT);
                 }
+                av_dict_free(&opts);
             }
         } else if (s->pattern_type == PT_GLOB) {
 #if HAVE_GLOB
@@ -369,6 +400,7 @@ int ff_img_read_packet(AVFormatContext *s1, AVPacket *pkt)
     int64_t size[3] = { 0 };
     AVIOContext *f[3] = { NULL };
     AVCodecParameters *par = s1->streams[0]->codecpar;
+    AVDictionary *opts = NULL;
 
     av_bprint_init(&filename, 0, AV_BPRINT_SIZE_UNLIMITED);
     if (!s->is_pipe) {
@@ -396,12 +428,19 @@ int ff_img_read_packet(AVFormatContext *s1, AVPacket *pkt)
             return AVERROR(ENOMEM);
         }
         for (i = 0; i < 3; i++) {
+            av_dict_set(&opts, "cookies", s->cookies, 0);
+            av_dict_set_int(&opts, "reconnect", s->reconnect, 0);
+            av_dict_set_int(&opts, "reconnect_on_network_error", s->reconnect_on_network_error, 0);
+            av_dict_set(&opts, "reconnect_on_http_error", s->reconnect_on_http_error, 0);
+            av_dict_set_int(&opts, "timeout", s->timeout, 0);
+
             if (s1->pb &&
                 !strcmp(filename.str, s1->url) &&
                 !s->loop &&
                 !s->split_planes) {
                 f[i] = s1->pb;
-            } else if ((res = s1->io_open(s1, &f[i], filename.str, AVIO_FLAG_READ, NULL)) < 0) {
+            } else if ((res = s1->io_open(s1, &f[i], filename.str, AVIO_FLAG_READ,  &opts)) < 0) {
+                av_dict_free(&opts);
                 if (i >= 1)
                     break;
                 av_log(s1, AV_LOG_ERROR, "Could not open file : %s\n",
@@ -409,6 +448,7 @@ int ff_img_read_packet(AVFormatContext *s1, AVPacket *pkt)
                 av_bprint_finalize(&filename, NULL);
                 return res;
             }
+            av_dict_free(&opts);
             size[i] = avio_size(f[i]);
 
             if (!s->split_planes)
@@ -603,7 +643,12 @@ const AVOption ff_img_options[] = {
     { "sec",  "second precision",       0, AV_OPT_TYPE_CONST,    {.i64 = 1   }, 0, 2,       DEC, .unit = "ts_type" },
     { "ns",   "nano second precision",  0, AV_OPT_TYPE_CONST,    {.i64 = 2   }, 0, 2,       DEC, .unit = "ts_type" },
     { "export_path_metadata", "enable metadata containing input path information", OFFSET(export_path_metadata), AV_OPT_TYPE_BOOL,   {.i64 = 0   }, 0, 1,       DEC }, \
-    COMMON_OPTIONS
+    { "cookies", "set cookies to be sent in applicable future requests, use newline delimited Set-Cookie HTTP field value syntax", OFFSET(cookies), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, DEC },
+    { "reconnect", "auto reconnect after disconnect before EOF", OFFSET(reconnect), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, DEC },
+    { "reconnect_on_network_error", "auto reconnect in case of tcp/tls error during connect", OFFSET(reconnect_on_network_error), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, DEC },
+    { "reconnect_on_http_error", "list of http status codes to reconnect on. the list can include specific status codes / 4xx / 5xx", OFFSET(reconnect_on_http_error), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, DEC },
+    { "timeout", "set timeout (in microseconds) of socket I/O operations", OFFSET(timeout), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, INT_MAX, DEC },
+        COMMON_OPTIONS
 };
 
 static const AVClass img2_class = {
