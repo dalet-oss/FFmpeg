@@ -662,23 +662,31 @@ const char *avio_find_protocol_name(const char *url)
     return p ? p->name : NULL;
 }
 
-int avio_check(const char *url, int flags)
+int avio_check2(const char *url, int flags, AVDictionary **options)
 {
     URLContext *h;
     int ret = ffurl_alloc(&h, url, flags, NULL);
     if (ret < 0)
         return ret;
 
+    if (h->prot->priv_data_class)
+        av_opt_set_dict(h->priv_data, options);
+
     if (h->prot->url_check) {
-        ret = h->prot->url_check(h, flags);
+        ret = h->prot->url_check(h, flags, options);
     } else {
-        ret = ffurl_connect(h, NULL);
+        ret = ffurl_connect(h, options);
         if (ret >= 0)
             ret = flags;
     }
 
     ffurl_close(h);
     return ret;
+}
+
+int avio_check(const char *url, int flags)
+{
+    return avio_check2(url, flags, NULL);
 }
 
 int ffurl_move(const char *url_src, const char *url_dst)

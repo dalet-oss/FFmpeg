@@ -166,7 +166,7 @@ static int file_get_handle(URLContext *h)
     return c->fd;
 }
 
-static int file_check(URLContext *h, int mask)
+static int file_check(URLContext *h, int mask, AVDictionary **options)
 {
     int ret = 0;
     const char *filename = h->filename;

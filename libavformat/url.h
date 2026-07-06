@@ -87,7 +87,7 @@ typedef struct URLProtocol {
     const AVClass *priv_data_class;
     int priv_data_size;
     int flags;
-    int (*url_check)(URLContext *h, int mask);
+    int (*url_check)(URLContext *h, int mask, AVDictionary **options);
     int (*url_open_dir)(URLContext *h);
     int (*url_read_dir)(URLContext *h, AVIODirEntry **next);
     int (*url_close_dir)(URLContext *h);
