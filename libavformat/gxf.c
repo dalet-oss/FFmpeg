@@ -67,6 +67,8 @@ static int add_timecode_metadata(AVDictionary **pm, const char *key, uint32_t ti
 static int parse_packet_header(AVIOContext *pb, GXFPktType *type, int *length) {
     if (avio_rb32(pb))
         return 0;
+    if (pb->eof_reached)
+        return 0;
     if (avio_r8(pb) != 1)
         return 0;
     *type = avio_r8(pb);
@@ -508,12 +510,16 @@ static int gxf_packet(AVFormatContext *s, AVPacket *pkt) {
         if (!parse_packet_header(pb, &pkt_type, &pkt_len)) {
             if (!avio_feof(pb))
                 av_log(s, AV_LOG_ERROR, "sync lost\n");
+            if (pb->eof_reached)
+                break;
             return -1;
         }
         if (pkt_type == PKT_FLT) {
             gxf_read_index(s, pkt_len);
             continue;
         }
+        if (pkt_type == PKT_EOS)
+            break;
         if (pkt_type != PKT_MEDIA) {
             avio_skip(pb, pkt_len);
             continue;
