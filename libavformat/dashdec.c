@@ -2401,6 +2401,27 @@ set_seq_num:
                (int64_t)pls->cur_seq_no);
     } else if (pls->fragment_duration > 0) {
         pls->cur_seq_no = pls->first_seq_no + ((seek_pos_msec * pls->fragment_timescale) / pls->fragment_duration) / 1000;
+
+        if (!dry_run) {
+            while (pls->cur_seq_no >= pls->first_seq_no) {
+                pls->cur_timestamp = 0;
+                pls->cur_seg_offset = 0;
+                pls->init_sec_buf_read_offset = 0;
+                ret = reopen_demux_for_component(s, pls);
+
+                if (ret < 0) {
+                    return ret;
+                }
+
+                if ((pls->ctx->start_time / 1000) <= seek_pos_msec) {
+                    return ret;
+                }
+
+                pls->cur_seq_no -= 1;
+                ff_format_io_close(pls->parent, &pls->input);
+                av_log(pls->parent, AV_LOG_TRACE, "dash_seek overshot: pls->ctx->start_time %lld > seek_pos_msec %lld, trying with lower segment number: %lld\n", pls->ctx->start_time, seek_pos_msec, pls->cur_seq_no);
+            }
+        }
     } else {
         av_log(pls->parent, AV_LOG_ERROR, "dash_seek missing timeline or fragment_duration\n");
         pls->cur_seq_no = pls->first_seq_no;
