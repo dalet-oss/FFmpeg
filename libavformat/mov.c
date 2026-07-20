@@ -11467,7 +11467,7 @@ static int mov_read_packet(AVFormatContext *s, AVPacket *pkt)
             goto retry;
         }
 
-        if (st->codecpar->codec_id == AV_CODEC_ID_EIA_608 && sample->size > 8)
+        if ((st->codecpar->codec_id == AV_CODEC_ID_EIA_608 || st->codecpar->codec_id == AV_CODEC_ID_EIA_708) && sample->size > 8)
             ret = get_eia608_packet(sc->pb, pkt, sample->size);
 #if CONFIG_IAMFDEC
         else if (sc->iamf) {
