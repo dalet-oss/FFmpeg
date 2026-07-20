@@ -88,6 +88,7 @@ struct representation {
 
     char *id;
     char *lang;
+    char *label;
     int bandwidth;
     char *dependencyid;
     char *codecs;
@@ -931,7 +932,8 @@ static int parse_manifest_representation(AVFormatContext *s, const char *url,
                                          xmlNodePtr content_component_node,
                                          xmlNodePtr adaptionset_baseurl_node,
                                          xmlNodePtr adaptionset_segmentlist_node,
-                                         xmlNodePtr adaptionset_supplementalproperty_node)
+                                         xmlNodePtr adaptionset_supplementalproperty_node,
+                                         xmlNodePtr adaptionset_label_node)
 {
     int32_t ret = 0;
     DASHContext *c = s->priv_data;
@@ -992,6 +994,13 @@ static int parse_manifest_representation(AVFormatContext *s, const char *url,
         rep->id = av_strdup(val);
         xmlFree(val);
         if (!rep->id)
+            goto enomem;
+    }
+    val = xmlNodeGetContent(adaptionset_label_node);
+    if (val) {
+        rep->label = av_strdup(val);
+        xmlFree(val);
+        if (!rep->label)
             goto enomem;
     }
 
@@ -1221,6 +1230,7 @@ static int parse_manifest_adaptationset(AVFormatContext *s, const char *url,
     xmlNodePtr adaptionset_baseurl_node = NULL;
     xmlNodePtr adaptionset_segmentlist_node = NULL;
     xmlNodePtr adaptionset_supplementalproperty_node = NULL;
+    xmlNodePtr adaptionset_label_node = NULL;
     xmlNodePtr node = NULL;
 
     ret = parse_manifest_adaptationset_attr(s, adaptionset_node);
@@ -1239,6 +1249,8 @@ static int parse_manifest_adaptationset(AVFormatContext *s, const char *url,
             adaptionset_segmentlist_node = node;
         } else if (!av_strcasecmp(node->name, "SupplementalProperty")) {
             adaptionset_supplementalproperty_node = node;
+        } else if (!av_strcasecmp(node->name, "Label")) {
+            adaptionset_label_node = node;
         } else if (!av_strcasecmp(node->name, "Representation")) {
             ret = parse_manifest_representation(s, url, node,
                                                 adaptionset_node,
@@ -1250,7 +1262,8 @@ static int parse_manifest_adaptationset(AVFormatContext *s, const char *url,
                                                 content_component_node,
                                                 adaptionset_baseurl_node,
                                                 adaptionset_segmentlist_node,
-                                                adaptionset_supplementalproperty_node);
+                                                adaptionset_supplementalproperty_node,
+                                                adaptionset_label_node);
             if (ret < 0)
                 goto err;
         }
@@ -2313,6 +2326,7 @@ static int dash_read_header(AVFormatContext *s)
             av_dict_set_int(&rep->assoc_stream[0]->metadata, "variant_bitrate", rep->bandwidth, 0);
         move_metadata(rep->assoc_stream[0], "id", &rep->id);
         move_metadata(rep->assoc_stream[0], "language", &rep->lang);
+        move_metadata(rep->assoc_stream[0], "comment", &rep->label);
     }
     for (i = 0; i < c->n_subtitles; i++) {
         rep = c->subtitles[i];
@@ -2326,6 +2340,7 @@ static int dash_read_header(AVFormatContext *s)
         }
         move_metadata(rep->assoc_stream[0], "id", &rep->id);
         move_metadata(rep->assoc_stream[0], "language", &rep->lang);
+        move_metadata(rep->assoc_stream[0], "comment", &rep->label);
     }
 
     /* Create stream groups if needed */
