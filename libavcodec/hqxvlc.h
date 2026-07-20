@@ -1553,7 +1553,7 @@ av_unused av_cold static void hqx_init_static(void)
 
         for (unsigned j = 0; j < nb_codes; ++j) {
             // lut[j] is in VLC (not RL_VLC) state
-            int sym = lut[j].sym;
+            int sym = (int16_t)lut[j].sym;
             int len = lut[j].len;
             int level;
 

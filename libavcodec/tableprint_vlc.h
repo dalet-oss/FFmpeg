@@ -41,7 +41,7 @@
 #include "vlc.c"
 
 // The following will have to be modified if VLCBaseType changes.
-WRITE_1D_FUNC_ARGV(VLCElem, 3, "{ .sym =%5" PRId16 ", .len =%2"PRIi16 " }",
+WRITE_1D_FUNC_ARGV(VLCElem, 3, "{ .sym =%5" PRId32 ", .len =%2"PRIi32 " }",
                    data[i].sym, data[i].len)
 
 static void write_vlc_type(const VLC *vlc, const VLCElem *base_table, const char *base_table_name)
