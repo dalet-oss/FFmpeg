@@ -596,6 +596,7 @@ enum AVCodecID {
     AV_CODEC_ID_TTML,
     AV_CODEC_ID_ARIB_CAPTION,
     AV_CODEC_ID_IVTV_VBI,
+    AV_CODEC_ID_EIA_708,
 
     /* other specific kind of codecs (generally used for attachments) */
     AV_CODEC_ID_FIRST_UNKNOWN = 0x18000,           ///< A dummy ID pointing at the start of various fake codecs.
