@@ -3756,6 +3756,13 @@ static const AVCodecDescriptor codec_descriptors[] = {
         .name      = "ivtv_vbi",
         .long_name = NULL_IF_CONFIG_SMALL("ivtv VBI captions"),
     },
+    {
+        .id        = AV_CODEC_ID_EIA_708,
+        .type      = AVMEDIA_TYPE_SUBTITLE,
+        .name      = "eia_708",
+        .long_name = NULL_IF_CONFIG_SMALL("EIA-708 closed captions"),
+        .props     = AV_CODEC_PROP_TEXT_SUB,
+    },
 
     /* other kind of codecs and pseudo-codecs */
     {
