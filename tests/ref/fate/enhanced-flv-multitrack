@@ -1,8 +1,8 @@
-fd79a2d2690c878a3b06cc66c4441e69 *tests/data/fate/enhanced-flv-multitrack.flv
-4697015 tests/data/fate/enhanced-flv-multitrack.flv
+0c801eec8f95e5342bc7493010ae1f3b *tests/data/fate/enhanced-flv-multitrack.flv
+4696928 tests/data/fate/enhanced-flv-multitrack.flv
 #extradata 0:       46, 0x6fed1203
 #extradata 1:       26, 0x5e13070a
-#extradata 2:       12, 0x044200af
+#extradata 2:       12, 0x044800b1
 #extradata 3:       27, 0x5f3604aa
 #extradata 4:       17, 0x1d8a047e
 #extradata 5:       34, 0x2b7301d1
