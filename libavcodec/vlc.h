@@ -27,7 +27,7 @@
 #define VLC_MULTI_MAX_SYMBOLS 6
 
 // When changing this, be sure to also update tableprint_vlc.h accordingly.
-typedef int16_t VLCBaseType;
+typedef int32_t VLCBaseType;
 
 typedef struct VLCElem {
     union {
