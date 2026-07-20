@@ -186,6 +186,16 @@ struct playlist {
      * index of the first timed-ID3 stream seen; -1 if none. */
     AVDictionary *timed_id3_metadata;
     int timed_id3_stream_index;
+
+    /* Offset (in ms, i.e. the WebVTT demuxer's stream time_base) to add to
+     * every cue's LOCAL timestamp so that it lands on the overall program
+     * timeline, derived from the current subtitle segment's WebVTT
+     * "X-TIMESTAMP-MAP" header (RFC 8216bis section 3.5). 0 if the segment
+     * has no such header. */
+    int64_t webvtt_ts_offset;
+    /* Set once the real start_time has been derived from the first
+     * segment's first cue, so later segments don't clobber it. */
+    int webvtt_start_time_known;
 };
 
 /*
@@ -1905,6 +1915,52 @@ static int nested_io_open(AVFormatContext *s, AVIOContext **pb, const char *url,
     return AVERROR(EPERM);
 }
 
+/* Parse the "X-TIMESTAMP-MAP" header (RFC 8216bis section 3.5) of an HLS
+ * WebVTT segment and return the offset, in milliseconds, that must be
+ * added to every cue's LOCAL timestamp in that segment to place it on the
+ * overall program timeline. Returns 0 if the header is absent, malformed,
+ * or the segment could not be read.
+ */
+static int64_t parse_webvtt_ts_offset(HLSContext *c, struct playlist *pls,
+                                      struct segment *seg)
+{
+    AVIOContext *in = NULL;
+    uint8_t buf[512];
+    char *hdr, *p, *local;
+    int64_t mpegts;
+    int hh, mm, ss, ms;
+    int len, ret;
+
+    if (!seg)
+        return 0;
+
+    ret = open_input(c, pls, seg, &in);
+    if (ret < 0)
+        return 0;
+
+    len = avio_read(in, buf, sizeof(buf) - 1);
+    ff_format_io_close(pls->parent, &in);
+    if (len <= 0)
+        return 0;
+    buf[len] = '\0';
+
+    hdr = strstr((char *)buf, "X-TIMESTAMP-MAP");
+    if (!hdr)
+        return 0;
+
+    p = strstr(hdr, "MPEGTS:");
+    if (!p)
+        return 0;
+    mpegts = strtoll(p + 7, NULL, 10);
+
+    local = strstr(hdr, "LOCAL:");
+    if (!local || sscanf(local + 6, "%d:%d:%d.%d", &hh, &mm, &ss, &ms) != 4)
+        return 0;
+
+    /* MPEGTS is a 90kHz clock; convert to ms and anchor it against LOCAL. */
+    return mpegts / 90 - (((int64_t)hh * 3600 + mm * 60 + ss) * 1000 + ms);
+}
+
 static int init_subtitle_context(struct playlist *pls)
 {
     HLSContext *c = pls->parent->priv_data;
@@ -1914,6 +1970,8 @@ static int init_subtitle_context(struct playlist *pls)
 
     if (!(pls->ctx = avformat_alloc_context()))
         return AVERROR(ENOMEM);
+
+    pls->webvtt_ts_offset = parse_webvtt_ts_offset(c, pls, current_segment(pls));
 
     pls->read_buffer = av_malloc(INITIAL_BUFFER_SIZE);
     if (!pls->read_buffer) {
@@ -1936,8 +1994,50 @@ static int init_subtitle_context(struct playlist *pls)
     av_dict_copy(&opts, c->seg_format_opts, 0);
     ret = avformat_open_input(&pls->ctx, current_segment(pls)->url, in_fmt, &opts);
     av_dict_free(&opts);
+    if (ret < 0)
+        return ret;
 
-    return ret;
+    /* avformat_find_stream_info()'s generic, packet-count/duration-based
+     * heuristics don't reliably discover start_time here (this nested
+     * context only ever holds one segment's worth of cues), and by the
+     * time a segment is actually opened, the *outer* HLS AVFormatContext's
+     * own avformat_find_stream_info() call has often already fallen back
+     * to the container-level start_time for this stream (since no segment
+     * had been read yet at that point). So: read this segment's first cue
+     * directly, once, and use it (offset-corrected) to set the real
+     * start_time -- overriding that earlier fallback. */
+    if (!pls->webvtt_start_time_known && pls->n_main_streams > 0) {
+        AVPacket *tmp_pkt = av_packet_alloc();
+        if (!tmp_pkt)
+            return AVERROR(ENOMEM);
+        if (av_read_frame(pls->ctx, tmp_pkt) >= 0 && tmp_pkt->pts != AV_NOPTS_VALUE) {
+            pls->main_streams[0]->start_time = tmp_pkt->pts + pls->webvtt_ts_offset;
+            pls->webvtt_start_time_known = 1;
+        }
+        av_packet_unref(tmp_pkt);
+        av_packet_free(&tmp_pkt);
+
+        /* Undo the read above: reopen so the upcoming real read in
+         * read_subtitle_packet() starts from this segment's first cue. */
+        avformat_close_input(&pls->ctx);
+        if (!(pls->ctx = avformat_alloc_context()))
+            return AVERROR(ENOMEM);
+        ffio_init_context(&pls->pb, pls->read_buffer, INITIAL_BUFFER_SIZE, 0, pls,
+                          read_data_subtitle_segment, NULL, NULL);
+        pls->pb.pub.seekable = 0;
+        pls->ctx->pb       = &pls->pb.pub;
+        pls->ctx->io_open  = nested_io_open;
+        ret = ff_copy_whiteblacklists(pls->ctx, pls->parent);
+        if (ret < 0)
+            return ret;
+        av_dict_copy(&opts, c->seg_format_opts, 0);
+        ret = avformat_open_input(&pls->ctx, current_segment(pls)->url, in_fmt, &opts);
+        av_dict_free(&opts);
+        if (ret < 0)
+            return ret;
+    }
+
+    return 0;
 }
 
 static int read_subtitle_packet(struct playlist *v, AVPacket *pkt)
@@ -1961,6 +2061,12 @@ restart:
 
     ret = av_read_frame(v->ctx, v->pkt);
     if (!ret) {
+        if (v->webvtt_ts_offset) {
+            if (v->pkt->pts != AV_NOPTS_VALUE)
+                v->pkt->pts += v->webvtt_ts_offset;
+            if (v->pkt->dts != AV_NOPTS_VALUE)
+                v->pkt->dts += v->webvtt_ts_offset;
+        }
         return ret;
     }
     ff_format_io_close(v->parent, &v->input);
