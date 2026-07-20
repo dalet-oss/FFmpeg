@@ -2581,21 +2581,34 @@ static int parameters_from_context(AVFormatContext *ic, AVCodecParameters *par,
     if (ret < 0)
         goto fail;
 
-    /* Restore some values if they are signaled at the container level
+    /* Restore some values if they are signaled at the container level,
      * given they may have been replaced by codec level values as read
-     * internally by avformat_find_stream_info().
-     */
-    if (par_tmp->color_range != AVCOL_RANGE_UNSPECIFIED)
-        par->color_range = par_tmp->color_range;
-    if (par_tmp->color_primaries != AVCOL_PRI_UNSPECIFIED ||
-        par_tmp->color_trc != AVCOL_TRC_UNSPECIFIED ||
-        par_tmp->color_space != AVCOL_SPC_UNSPECIFIED) {
-        par->color_primaries = par_tmp->color_primaries;
-        par->color_trc = par_tmp->color_trc;
-        par->color_space = par_tmp->color_space;
+     * internally by avformat_find_stream_info(). This is specifically an
+     * ISOBMFF ('colr' box) rule (ISO/IEC 14496-12: "If colour information
+     * is supplied in both this box, and also in the video bitstream, this
+     * box takes precedence, and over-rides the information in the
+     * bitstream") -- other container formats make no such guarantee, and
+     * for some (e.g. MXF) container-level color metadata has been observed
+     * to be less reliable than the bitstream's own signaling. So this only
+     * applies to ISOBMFF-family containers (mov/mp4/3gp/etc.); for
+     * everything else the decoder-derived values are kept as-is. */
+    if (!strcmp(ic->iformat->name, "mov,mp4,m4a,3gp,3g2,mj2")) {
+        if (par_tmp->color_range != AVCOL_RANGE_UNSPECIFIED)
+            par->color_range = par_tmp->color_range;
+        /* Each of these three is restored independently: the container may
+         * have signaled only some of them, and treating them as an all-or-
+         * nothing group would overwrite a decoder-derived value for a field
+         * the container did *not* signal with the container's unspecified
+         * value for that same field. */
+        if (par_tmp->color_primaries != AVCOL_PRI_UNSPECIFIED)
+            par->color_primaries = par_tmp->color_primaries;
+        if (par_tmp->color_trc != AVCOL_TRC_UNSPECIFIED)
+            par->color_trc = par_tmp->color_trc;
+        if (par_tmp->color_space != AVCOL_SPC_UNSPECIFIED)
+            par->color_space = par_tmp->color_space;
+        if (par_tmp->chroma_location != AVCHROMA_LOC_UNSPECIFIED)
+            par->chroma_location = par_tmp->chroma_location;
     }
-    if (par_tmp->chroma_location != AVCHROMA_LOC_UNSPECIFIED)
-        par->chroma_location = par_tmp->chroma_location;
 
     ret = 0;
 fail:
