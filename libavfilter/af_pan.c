@@ -38,7 +38,7 @@
 #include "filters.h"
 #include "formats.h"
 
-#define MAX_CHANNELS 64
+#define MAX_CHANNELS 128
 
 typedef struct PanContext {
     const AVClass *class;
