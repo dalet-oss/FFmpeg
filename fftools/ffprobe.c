@@ -1799,7 +1799,10 @@ static int read_interval_packets(AVTextFormatContext *tfc, InputFile *ifile,
     for (int i = 0; i < ifile->nb_streams; i++) {
         pkt->stream_index = i;
         if (do_read_frames) {
-            while (process_frame(tfc, ifile, frame, pkt, &(int){1}) > 0);
+            int new_packet = 1;
+            while (process_frame(tfc, ifile, frame, pkt, &new_packet) > 0) {
+                new_packet = 0;
+            }
         }
     }
 
