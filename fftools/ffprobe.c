@@ -2604,6 +2604,12 @@ static int probe_file(AVTextFormatContext *tfc, const char *filename,
         }
         if (!selected_streams[i])
             ifile.fmt_ctx->streams[i]->discard = AVDISCARD_ALL;
+        else
+            /* Some demuxers (e.g. HLS subtitle renditions) start streams out
+             * discarded by default until the caller opts in. An explicit
+             * stream selection should override that, not just leave
+             * whatever the demuxer set. */
+            ifile.fmt_ctx->streams[i]->discard = AVDISCARD_DEFAULT;
     }
 
     if (do_read_frames || do_read_packets) {
