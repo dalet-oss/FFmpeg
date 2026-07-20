@@ -1230,7 +1230,7 @@ static int mov_get_lpcm_flags(enum AVCodecID codec_id)
     }
 }
 
-static int get_cluster_duration(MOVTrack *track, int cluster_idx)
+static unsigned int get_cluster_duration(MOVTrack *track, int cluster_idx)
 {
     int64_t next_dts;
 
@@ -1245,14 +1245,15 @@ static int get_cluster_duration(MOVTrack *track, int cluster_idx)
     next_dts -= track->cluster[cluster_idx].dts;
 
     av_assert0(next_dts >= 0);
-    av_assert0(next_dts <= INT_MAX);
+    av_assert0(next_dts <= UINT32_MAX);
 
     return next_dts;
 }
 
-static int get_samples_per_packet(MOVTrack *track)
+static unsigned int get_samples_per_packet(MOVTrack *track)
 {
-    int i, first_duration;
+    int i;
+    unsigned int first_duration;
 
     /* use 1 for raw PCM */
     if (!track->audio_vbr)
@@ -3224,7 +3225,7 @@ static int mov_write_stts_tag(AVIOContext *pb, MOVTrack *track)
                 return AVERROR(ENOMEM);
         }
         for (i = 0; i < track->entry; i++) {
-            int duration = get_cluster_duration(track, i);
+            unsigned int duration = get_cluster_duration(track, i);
 #if CONFIG_IAMFENC
             if (track->iamf && track->par->codec_id == AV_CODEC_ID_OPUS)
                 duration = av_rescale(duration, 48000, track->par->sample_rate);
@@ -3296,7 +3297,7 @@ static int mov_preroll_write_stbl_atoms(AVIOContext *pb, MOVTrack *track)
 
     if (track->par->codec_id == AV_CODEC_ID_OPUS) {
         for (i = 0; i < track->entry; i++) {
-            int roll_samples_remaining = roll_samples;
+            int64_t roll_samples_remaining = roll_samples;
             int distance = 0;
             for (j = i - 1; j >= 0; j--) {
                 roll_samples_remaining -= get_cluster_duration(track, j);
