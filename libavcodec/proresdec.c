@@ -279,8 +279,16 @@ static int decode_frame_header(ProresContext *ctx, const uint8_t *buf,
 #endif
     }
 
-    ctx->frame->color_primaries = buf[14];
-    ctx->frame->color_trc       = buf[15];
+    /* A raw value of 0 in these bitstream fields is the ProRes encoder's
+     * "not specified" sentinel (see e.g. int_from_list_or_default() in
+     * proresenc_anatoliy.c, which falls back to 0 instead of the correct
+     * *_UNSPECIFIED value when a source's primaries/trc isn't in its
+     * supported list), not a genuine AVCOL_*_RESERVED0 signal. Map it to
+     * *_UNSPECIFIED so fill_frame_props() (libavcodec/decode.c) can still
+     * backfill from avctx -- and transitively from container-level color
+     * values -- instead of locking in "reserved". */
+    ctx->frame->color_primaries = buf[14] ? buf[14] : AVCOL_PRI_UNSPECIFIED;
+    ctx->frame->color_trc       = buf[15] ? buf[15] : AVCOL_TRC_UNSPECIFIED;
     ctx->frame->colorspace      = buf[16];
     ctx->frame->color_range     = AVCOL_RANGE_MPEG;
 
