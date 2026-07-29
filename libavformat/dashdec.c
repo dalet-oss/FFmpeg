@@ -1661,8 +1661,9 @@ static struct fragment *get_current_fragment(struct representation *pls)
     int reload_count = 0;
 
     while (( !ff_check_interrupt(c->interrupt_callback)&& pls->n_fragments > 0)) {
-        if (pls->cur_seq_no < pls->n_fragments) {
-            seg_ptr = pls->fragments[pls->cur_seq_no];
+        if (pls->cur_seq_no >= pls->first_seq_no &&
+            pls->cur_seq_no - pls->first_seq_no < pls->n_fragments) {
+            seg_ptr = pls->fragments[pls->cur_seq_no - pls->first_seq_no];
             seg = av_mallocz(sizeof(struct fragment));
             if (!seg) {
                 return NULL;
@@ -1917,12 +1918,12 @@ restart:
     /* check the v->cur_seg, if it is null, get current and double check if the new v->cur_seg*/
     if (!v->cur_seg) {
         v->cur_seg = get_current_fragment(v);
+        if (!v->cur_seg) {
+            ret = AVERROR_EOF;
+            goto end;
+        }
         v->cur_seg_size = v->cur_seg->size;
         v->cur_seg_offset = 0;
-    }
-    if (!v->cur_seg) {
-        ret = AVERROR_EOF;
-        goto end;
     }
     ret = read_from_url(v, v->cur_seg, buf, buf_size);
     if (ret > 0)
