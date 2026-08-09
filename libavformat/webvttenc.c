@@ -27,6 +27,7 @@
 #include "avformat.h"
 #include "internal.h"
 #include "mux.h"
+#include "webvttenc.h"
 
 static void webvtt_write_time(AVIOContext *pb, int64_t millisec)
 {
@@ -56,9 +57,8 @@ static int webvtt_write_header(AVFormatContext *ctx)
     return 0;
 }
 
-static int webvtt_write_packet(AVFormatContext *ctx, AVPacket *pkt)
+void ff_webvtt_write_cue(AVIOContext *pb, const AVPacket *pkt)
 {
-    AVIOContext  *pb = ctx->pb;
     size_t id_size, settings_size;
     int id_size_int, settings_size_int;
     uint8_t *id, *settings;
@@ -68,10 +68,7 @@ static int webvtt_write_packet(AVFormatContext *ctx, AVPacket *pkt)
     id = av_packet_get_side_data(pkt, AV_PKT_DATA_WEBVTT_IDENTIFIER,
                                  &id_size);
 
-    if (id_size > INT_MAX)
-        return AVERROR(EINVAL);
-
-    id_size_int = id_size;
+    id_size_int = id_size > INT_MAX ? 0 : id_size;
     if (id && id_size_int > 0)
         avio_printf(pb, "%.*s\n", id_size_int, id);
 
@@ -82,10 +79,7 @@ static int webvtt_write_packet(AVFormatContext *ctx, AVPacket *pkt)
     settings = av_packet_get_side_data(pkt, AV_PKT_DATA_WEBVTT_SETTINGS,
                                        &settings_size);
 
-    if (settings_size > INT_MAX)
-        return AVERROR(EINVAL);
-
-    settings_size_int = settings_size;
+    settings_size_int = settings_size > INT_MAX ? 0 : settings_size;
     if (settings && settings_size_int > 0)
         avio_printf(pb, " %.*s", settings_size_int, settings);
 
@@ -93,7 +87,11 @@ static int webvtt_write_packet(AVFormatContext *ctx, AVPacket *pkt)
 
     avio_write(pb, pkt->data, pkt->size);
     avio_printf(pb, "\n");
+}
 
+static int webvtt_write_packet(AVFormatContext *ctx, AVPacket *pkt)
+{
+    ff_webvtt_write_cue(ctx->pb, pkt);
     return 0;
 }
 
