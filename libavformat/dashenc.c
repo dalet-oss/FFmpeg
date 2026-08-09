@@ -58,6 +58,7 @@ typedef enum {
     SEGMENT_TYPE_AUTO = 0,
     SEGMENT_TYPE_MP4,
     SEGMENT_TYPE_WEBM,
+    SEGMENT_TYPE_WEBVTT,
     SEGMENT_TYPE_NB
 } SegmentType;
 
@@ -71,6 +72,10 @@ enum {
 
 #define MPD_PROFILE_DASH 1
 #define MPD_PROFILE_DVB  2
+
+/* Nominal @bandwidth for a text representation, which carries no bit rate of
+ * its own while the attribute is mandatory. */
+#define DASH_MIN_TEXT_BITRATE 1000
 
 typedef struct Segment {
     char file[1024];
@@ -115,6 +120,7 @@ typedef struct OutputStream {
     int64_t last_duration;
     Segment **segments;
     int64_t first_pts, start_pts, max_pts;
+    int64_t cue_end_pts; ///< end of the last cue of a text stream, which max_pts is snapped to the segment grid for
     int64_t last_dts, last_pts;
     int last_flags;
     int bit_rate;
@@ -189,6 +195,7 @@ typedef struct DASHContext {
     int ldash;
     int master_publish_rate;
     int nr_of_streams_to_flush;
+    int ref_stream_index; ///< stream whose segment boundaries the text streams follow
     int nr_of_streams_flushed;
     int frag_type;
     int write_prft;
@@ -243,8 +250,9 @@ static void dashenc_io_close(AVFormatContext *s, AVIOContext **pb, char *filenam
 static const char *get_format_str(SegmentType segment_type)
 {
     switch (segment_type) {
-    case SEGMENT_TYPE_MP4:  return "mp4";
-    case SEGMENT_TYPE_WEBM: return "webm";
+    case SEGMENT_TYPE_MP4:    return "mp4";
+    case SEGMENT_TYPE_WEBM:   return "webm";
+    case SEGMENT_TYPE_WEBVTT: return "webvtt";
     }
     return NULL;
 }
@@ -253,8 +261,9 @@ static const char *get_extension_str(SegmentType type, int single_file)
 {
     switch (type) {
 
-    case SEGMENT_TYPE_MP4:  return single_file ? "mp4" : "m4s";
-    case SEGMENT_TYPE_WEBM: return "webm";
+    case SEGMENT_TYPE_MP4:    return single_file ? "mp4" : "m4s";
+    case SEGMENT_TYPE_WEBM:   return "webm";
+    case SEGMENT_TYPE_WEBVTT: return "vtt";
     default: return NULL;
     }
 }
@@ -266,8 +275,16 @@ static int handle_io_open_error(AVFormatContext *s, int err, char *url) {
     return c->ignore_io_errors ? 0 : err;
 }
 
-static inline SegmentType select_segment_type(SegmentType segment_type, enum AVCodecID codec_id)
+static inline SegmentType select_segment_type(SegmentType segment_type, enum AVCodecID codec_id,
+                                              int single_file)
 {
+    /* WebVTT is carried either as the single side loaded file a whole Period is
+     * allowed to have, or, when the output is segmented, as an ISO/IEC 14496-30
+     * text track in the regular mp4 segments. Segmented plain WebVTT files are
+     * not a DASH segment format. */
+    if (codec_id == AV_CODEC_ID_WEBVTT)
+        return single_file ? SEGMENT_TYPE_WEBVTT : SEGMENT_TYPE_MP4;
+
     if (segment_type == SEGMENT_TYPE_AUTO) {
         if (codec_id == AV_CODEC_ID_OPUS || codec_id == AV_CODEC_ID_VORBIS ||
             codec_id == AV_CODEC_ID_VP8 || codec_id == AV_CODEC_ID_VP9) {
@@ -287,7 +304,7 @@ static int init_segment_types(AVFormatContext *s)
     for (int i = 0; i < s->nb_streams; ++i) {
         OutputStream *os = &c->streams[i];
         SegmentType segment_type = select_segment_type(
-            c->segment_type_option, s->streams[i]->codecpar->codec_id);
+            c->segment_type_option, s->streams[i]->codecpar->codec_id, c->single_file);
         os->segment_type = segment_type;
         os->format_name = get_format_str(segment_type);
         if (!os->format_name) {
@@ -309,6 +326,14 @@ static int init_segment_types(AVFormatContext *s)
     }
 
     return 0;
+}
+
+/* Whether this stream is a text track carried in the mp4 segments, as opposed
+ * to a side loaded WebVTT file. */
+static inline int is_text_in_mp4(const AVStream *st, const OutputStream *os)
+{
+    return st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE &&
+           os->segment_type == SEGMENT_TYPE_MP4;
 }
 
 static int flush_dynbuf(DASHContext *c, OutputStream *os, int *range_length)
@@ -559,8 +584,10 @@ static void output_segment_list(OutputStream *os, AVIOContext *out, AVFormatCont
         }
         avio_printf(out, "\t\t\t\t</SegmentTemplate>\n");
     } else if (c->single_file) {
+        int64_t seglist_duration = s->streams[representation_id]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE ?
+                                    os->last_duration : FFMIN(os->seg_duration, os->last_duration);
         avio_printf(out, "\t\t\t\t<BaseURL>%s</BaseURL>\n", os->initfile);
-        avio_printf(out, "\t\t\t\t<SegmentList timescale=\"%d\" duration=\"%"PRId64"\" startNumber=\"%d\">\n", AV_TIME_BASE, FFMIN(os->seg_duration, os->last_duration), start_number);
+        avio_printf(out, "\t\t\t\t<SegmentList timescale=\"%d\" duration=\"%"PRId64"\" startNumber=\"%d\">\n", AV_TIME_BASE, seglist_duration, start_number);
         avio_printf(out, "\t\t\t\t\t<Initialization range=\"%"PRId64"-%"PRId64"\" />\n", os->init_start_pos, os->init_start_pos + os->init_range_length - 1);
         for (i = start_index; i < os->nb_segments; i++) {
             Segment *seg = os->segments[i];
@@ -668,7 +695,8 @@ static int write_adaptation_set(AVFormatContext *s, AVIOContext *out, int as_ind
     int i;
 
     avio_printf(out, "\t\t<AdaptationSet id=\"%d\" contentType=\"%s\" startWithSAP=\"1\" segmentAlignment=\"true\" bitstreamSwitching=\"true\"",
-                as->id, as->media_type == AVMEDIA_TYPE_VIDEO ? "video" : "audio");
+                as->id, as->media_type == AVMEDIA_TYPE_VIDEO ? "video" :
+                        as->media_type == AVMEDIA_TYPE_AUDIO ? "audio" : "text");
     if (as->media_type == AVMEDIA_TYPE_VIDEO && as->max_frame_rate.num && !as->ambiguous_frame_rate && av_cmp_q(as->min_frame_rate, as->max_frame_rate) < 0)
         avio_printf(out, " maxFrameRate=\"%d/%d\"", as->max_frame_rate.num, as->max_frame_rate.den);
     else if (as->media_type == AVMEDIA_TYPE_VIDEO && as->max_frame_rate.num && !as->ambiguous_frame_rate && !av_cmp_q(as->min_frame_rate, as->max_frame_rate))
@@ -680,6 +708,8 @@ static int write_adaptation_set(AVFormatContext *s, AVIOContext *out, int as_ind
     lang = av_dict_get(as->metadata, "language", NULL, 0);
     if (lang)
         avio_printf(out, " lang=\"%s\"", lang->value);
+    else if (as->media_type == AVMEDIA_TYPE_SUBTITLE)
+        avio_printf(out, " lang=\"und\""); // mandatory on a text adaptation set
     avio_printf(out, ">\n");
 
     if (!final && c->ldash && as->max_frag_duration && !(c->profile & MPD_PROFILE_DVB))
@@ -703,9 +733,16 @@ static int write_adaptation_set(AVFormatContext *s, AVIOContext *out, int as_ind
             snprintf(bandwidth_str, sizeof(bandwidth_str), " bandwidth=\"%d\"", os->bit_rate);
         else if (final) {
             int average_bit_rate = os->pos * 8 * AV_TIME_BASE / c->total_duration;
+            if (!average_bit_rate && as->media_type == AVMEDIA_TYPE_SUBTITLE)
+                average_bit_rate = DASH_MIN_TEXT_BITRATE;
             snprintf(bandwidth_str, sizeof(bandwidth_str), " bandwidth=\"%d\"", average_bit_rate);
         } else if (os->first_segment_bit_rate > 0)
             snprintf(bandwidth_str, sizeof(bandwidth_str), " bandwidth=\"%d\"", os->first_segment_bit_rate);
+        else if (as->media_type == AVMEDIA_TYPE_SUBTITLE) {
+            /* @bandwidth is mandatory, but a text representation carries no bit
+             * rate and may not have written a single segment yet. */
+            snprintf(bandwidth_str, sizeof(bandwidth_str), " bandwidth=\"%d\"", DASH_MIN_TEXT_BITRATE);
+        }
 
         if (as->media_type == AVMEDIA_TYPE_VIDEO) {
             avio_printf(out, "\t\t\t<Representation id=\"%d\" mimeType=\"video/%s\" codecs=\"%s\"%s width=\"%d\" height=\"%d\"",
@@ -725,11 +762,21 @@ static int write_adaptation_set(AVFormatContext *s, AVIOContext *out, int as_ind
             if (!os->coding_dependency)
                 avio_printf(out, " codingDependency=\"false\"");
             avio_printf(out, ">\n");
-        } else {
+        } else if (as->media_type == AVMEDIA_TYPE_AUDIO) {
             avio_printf(out, "\t\t\t<Representation id=\"%d\" mimeType=\"audio/%s\" codecs=\"%s\"%s audioSamplingRate=\"%d\">\n",
                 i, os->format_name, os->codec_str, bandwidth_str, s->streams[i]->codecpar->sample_rate);
             avio_printf(out, "\t\t\t\t<AudioChannelConfiguration schemeIdUri=\"urn:mpeg:dash:23003:3:audio_channel_configuration:2011\" value=\"%d\" />\n",
                 s->streams[i]->codecpar->ch_layout.nb_channels);
+        } else { // AVMEDIA_TYPE_SUBTITLE
+            /* A side loaded WebVTT file is signalled with its own mime type and
+             * carries no @codecs, an ISO BMFF text track is signalled like any
+             * other mp4 representation. */
+            if (os->segment_type == SEGMENT_TYPE_WEBVTT)
+                avio_printf(out, "\t\t\t<Representation id=\"%d\" mimeType=\"text/vtt\"%s>\n",
+                    i, bandwidth_str);
+            else
+                avio_printf(out, "\t\t\t<Representation id=\"%d\" mimeType=\"application/%s\" codecs=\"%s\"%s>\n",
+                    i, os->format_name, os->codec_str, bandwidth_str);
         }
         if (!final && c->write_prft && os->producer_reference_time_str[0]) {
             avio_printf(out, "\t\t\t\t<ProducerReferenceTime id=\"%d\" inband=\"true\" type=\"%s\" wallClockTime=\"%s\" presentationTime=\"%"PRId64"\">\n",
@@ -821,7 +868,9 @@ static int parse_adaptation_sets(AVFormatContext *s)
     // option id=0,seg_duration=2.5,frag_duration=0.5,streams=0,1,2
     //        id=1,trick_id=0,seg_duration=10,frag_type=none,streams=3 and so on
     // descriptor is useful to the scheme defined by ISO/IEC 23009-1:2014/Amd.2:2015
-    // descriptor_str should be a self-closing xml tag.
+    // descriptor_str should be a single xml element, either self-closing
+    // (e.g. <Role schemeIdUri="..." value="main"/>) or a paired tag with
+    // text content (e.g. <Label>audio-1</Label>).
     // seg_duration and frag_duration have the same syntax as the global options of
     // the same name, and the former have precedence over them if set.
     state = new_set;
@@ -897,17 +946,43 @@ static int parse_adaptation_sets(AVFormatContext *s)
             }
             state = parse_default;
         } else if (state != new_set && av_strstart(p, "descriptor=", &p)) {
-            n = strcspn(p, ">") + 1; //followed by one comma, so plus 1
-            if (n < strlen(p)) {
-                as->descriptor = av_strndup(p, n);
-            } else {
-                av_log(s, AV_LOG_ERROR, "Parse error, descriptor string should be a self-closing xml tag\n");
+            const char *tag_end = strchr(p, '>');
+
+            if (*p != '<' || !tag_end) {
+                av_log(s, AV_LOG_ERROR, "Parse error, descriptor string is not a valid xml element\n");
                 return AVERROR(EINVAL);
             }
+
+            if (*(tag_end - 1) == '/') {
+                // self-closing tag, e.g. <Role schemeIdUri="..." value="main"/>
+                n = tag_end - p + 1;
+            } else {
+                // paired tag with text content, e.g. <Label>audio-1-dash-label</Label>
+                const char *name_end = p + 1;
+                char close_tag[68];
+                int name_len;
+
+                while (*name_end && *name_end != ' ' && *name_end != '>' && *name_end != '/')
+                    name_end++;
+                name_len = name_end - (p + 1);
+                if (name_len <= 0 || name_len >= sizeof(close_tag) - 3) {
+                    av_log(s, AV_LOG_ERROR, "Parse error, descriptor string is not a valid xml element\n");
+                    return AVERROR(EINVAL);
+                }
+                snprintf(close_tag, sizeof(close_tag), "</%.*s>", name_len, p + 1);
+                tag_end = strstr(p, close_tag);
+                if (!tag_end) {
+                    av_log(s, AV_LOG_ERROR, "Parse error, could not find closing tag \"%s\" for descriptor\n", close_tag);
+                    return AVERROR(EINVAL);
+                }
+                n = tag_end - p + strlen(close_tag);
+            }
+
+            as->descriptor = av_strndup(p, n);
             p += n;
+            state = (*p == ' ') ? new_set : parse_default;
             if (*p)
                 p++;
-            state = parse_default;
         } else if ((state != new_set) && av_strstart(p, "trick_id=", &p)) {
             char trick_id_str[10], *end_str;
 
@@ -932,9 +1007,12 @@ static int parse_adaptation_sets(AVFormatContext *s)
             snprintf(idx_str, sizeof(idx_str), "%.*s", n, p);
             p += n;
 
-            // if value is "a" or "v", map all streams of that type
-            if (as->media_type == AVMEDIA_TYPE_UNKNOWN && (idx_str[0] == 'v' || idx_str[0] == 'a')) {
-                enum AVMediaType type = (idx_str[0] == 'v') ? AVMEDIA_TYPE_VIDEO : AVMEDIA_TYPE_AUDIO;
+            // if value is "a", "v" or "s", map all streams of that type
+            if (as->media_type == AVMEDIA_TYPE_UNKNOWN &&
+                (idx_str[0] == 'v' || idx_str[0] == 'a' || idx_str[0] == 's')) {
+                enum AVMediaType type = (idx_str[0] == 'v') ? AVMEDIA_TYPE_VIDEO :
+                                        (idx_str[0] == 'a') ? AVMEDIA_TYPE_AUDIO :
+                                                               AVMEDIA_TYPE_SUBTITLE;
                 av_log(s, AV_LOG_DEBUG, "Map all streams of type %s\n", idx_str);
 
                 for (i = 0; i < s->nb_streams; i++) {
@@ -1251,6 +1329,7 @@ static int dash_init(AVFormatContext *s)
     char basename[1024];
 
     c->nr_of_streams_to_flush = 0;
+    c->ref_stream_index = -1;
     if (c->single_file_name)
         c->single_file = 1;
     if (c->single_file)
@@ -1364,7 +1443,7 @@ static int dash_init(AVFormatContext *s)
         AVBPrint buffer;
 
         os->bit_rate = s->streams[i]->codecpar->bit_rate;
-        if (!os->bit_rate) {
+        if (!os->bit_rate && s->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
             int level = s->strict_std_compliance >= FF_COMPLIANCE_STRICT ?
                         AV_LOG_ERROR : AV_LOG_WARNING;
             av_log(s, level, "No bit rate set for stream %d\n", i);
@@ -1446,7 +1525,7 @@ static int dash_init(AVFormatContext *s)
             if (os->single_file_name)
                 ff_dash_fill_tmpl_params(os->initfile, sizeof(os->initfile), os->single_file_name, i, 0, os->bit_rate, 0);
             else
-                snprintf(os->initfile, sizeof(os->initfile), "%s-stream%d.%s", basename, i, os->format_name);
+                snprintf(os->initfile, sizeof(os->initfile), "%s-stream%d.%s", basename, i, os->extension_name);
         } else {
             ff_dash_fill_tmpl_params(os->initfile, sizeof(os->initfile), os->init_seg_name, i, 0, os->bit_rate, 0);
         }
@@ -1511,7 +1590,13 @@ static int dash_init(AVFormatContext *s)
                 else
                     av_dict_set(&opts, "movflags", "+dash+delay_moov+skip_trailer", AV_DICT_APPEND);
             }
-            if (os->frag_type == FRAG_TYPE_EVERY_FRAME)
+            /* A text track has its samples generated per fragment by the mp4
+             * muxer, so it is fragmented by us, one fragment per segment, and
+             * never by a duration or a frame count of its own. */
+            if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+                os->frag_type = FRAG_TYPE_NONE;
+                av_dict_set(&opts, "movflags", "+frag_custom", AV_DICT_APPEND);
+            } else if (os->frag_type == FRAG_TYPE_EVERY_FRAME)
                 av_dict_set(&opts, "movflags", "+frag_every_frame", AV_DICT_APPEND);
             else
                 av_dict_set(&opts, "movflags", "+frag_custom", AV_DICT_APPEND);
@@ -1519,13 +1604,14 @@ static int dash_init(AVFormatContext *s)
                 av_dict_set_int(&opts, "frag_duration", os->frag_duration, 0);
             if (c->write_prft)
                 av_dict_set(&opts, "write_prft", "wallclock", 0);
-        } else {
+        } else if (os->segment_type == SEGMENT_TYPE_WEBM) {
             av_dict_set_int(&opts, "cluster_time_limit", c->seg_duration / 1000, 0);
             av_dict_set_int(&opts, "cluster_size_limit", 5 * 1024 * 1024, 0); // set a large cluster size limit
             av_dict_set_int(&opts, "dash", 1, 0);
             av_dict_set_int(&opts, "dash_track_number", i + 1, 0);
             av_dict_set_int(&opts, "live", 1, 0);
         }
+        // SEGMENT_TYPE_WEBVTT: ff_webvtt_muxer has no format-specific options
         ret = avformat_init_output(ctx, &opts);
         av_dict_free(&opts);
         if (ret < 0)
@@ -1584,6 +1670,13 @@ static int dash_init(AVFormatContext *s)
 
         if (s->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
             c->nr_of_streams_to_flush++;
+
+        /* Text streams follow the video, or the audio when there is no video. */
+        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO ?
+            (c->ref_stream_index < 0 ||
+             s->streams[c->ref_stream_index]->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) :
+            (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && c->ref_stream_index < 0))
+            c->ref_stream_index = i;
     }
 
     if (!c->has_video && c->seg_duration <= 0) {
@@ -1609,9 +1702,10 @@ static int dash_write_header(AVFormatContext *s)
             return ret;
 
         // Flush init segment
-        // Only for WebM segment, since for mp4 delay_moov is set and
+        // Only for WebM/WebVTT, since for mp4 delay_moov is set and
         // the init segment is thus flushed after the first packets.
-        if (os->segment_type == SEGMENT_TYPE_WEBM &&
+        if ((os->segment_type == SEGMENT_TYPE_WEBM ||
+             os->segment_type == SEGMENT_TYPE_WEBVTT) &&
             (ret = flush_init_segment(s, os)) < 0)
             return ret;
     }
@@ -1778,6 +1872,47 @@ static inline void dashenc_delete_media_segments(AVFormatContext *s, OutputStrea
     memmove(os->segments, os->segments + remove_count, os->nb_segments * sizeof(*os->segments));
 }
 
+/* Open the file of the segment that is about to be written, and let the clients
+ * know about it. */
+static int dashenc_start_segment(AVFormatContext *s, OutputStream *os,
+                                 int stream_index)
+{
+    DASHContext *c = s->priv_data;
+    AVDictionary *opts = NULL;
+    const char *proto = avio_find_protocol_name(s->url);
+    int use_rename = proto && !strcmp(proto, "file");
+    int ret;
+
+    if (os->segment_type == SEGMENT_TYPE_MP4)
+        write_styp(os->ctx->pb);
+    os->filename[0] = os->full_path[0] = os->temp_path[0] = '\0';
+    ff_dash_fill_tmpl_params(os->filename, sizeof(os->filename),
+                             os->media_seg_name, stream_index,
+                             os->segment_index, os->bit_rate, os->start_pts);
+    snprintf(os->full_path, sizeof(os->full_path), "%s%s", c->dirname,
+             os->filename);
+    snprintf(os->temp_path, sizeof(os->temp_path),
+             use_rename ? "%s.tmp" : "%s", os->full_path);
+    set_http_options(&opts, c);
+    ret = dashenc_io_open(s, &os->out, os->temp_path, &opts);
+    av_dict_free(&opts);
+    if (ret < 0)
+        return handle_io_open_error(s, ret, os->temp_path);
+
+    // in streaming mode, the segments are available for playing
+    // before fully written but the manifest is needed so that
+    // clients and discover the segment filenames.
+    if (c->streaming)
+        write_manifest(s, 0);
+
+    if (c->lhls) {
+        char *prefetch_url = use_rename ? NULL : os->filename;
+        write_hls_media_playlist(os, s, stream_index, 0, prefetch_url);
+    }
+
+    return 0;
+}
+
 static int dash_flush(AVFormatContext *s, int final, int stream)
 {
     DASHContext *c = s->priv_data;
@@ -1808,22 +1943,78 @@ static int dash_flush(AVFormatContext *s, int final, int stream)
         int range_length, index_length = 0;
         int64_t duration;
 
-        if (!os->packets_written)
-            continue;
-
         // Flush the single stream that got a keyframe right now.
-        // Flush all audio streams as well, in sync with video keyframes,
-        // but not the other video streams.
+        // Flush all audio and subtitle streams as well, in sync with video
+        // keyframes, but not the other video streams.
         if (stream >= 0 && i != stream) {
-            if (s->streams[stream]->codecpar->codec_type != AVMEDIA_TYPE_VIDEO &&
-                s->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_VIDEO)
+            enum AVMediaType flush_type = s->streams[stream]->codecpar->codec_type;
+            enum AVMediaType type = st->codecpar->codec_type;
+
+            if (type == AVMEDIA_TYPE_SUBTITLE) {
+                /* Text streams have no boundaries of their own, they take those
+                 * of the reference stream, so that their segments are aligned
+                 * with the media and there is exactly one of them per segment. */
+                if (stream != c->ref_stream_index)
+                    continue;
+            } else if (type != AVMEDIA_TYPE_AUDIO ||
+                       flush_type != AVMEDIA_TYPE_VIDEO) {
                 continue;
-            if (s->streams[i]->codecpar->codec_type != AVMEDIA_TYPE_AUDIO)
-                continue;
-            // Make sure we don't flush audio streams multiple times, when
+            }
+            // Make sure we don't flush those streams multiple times, when
             // all video streams are flushed one at a time.
             if (c->has_video && os->segment_index > cur_flush_segment_index)
                 continue;
+        }
+
+        if (is_text_in_mp4(st, os)) {
+            /* The mp4 muxer generates the samples of a text track per fragment,
+             * so it needs to be told where the segment ends, and our own
+             * accounting has to follow that same grid rather than the cue
+             * timings. A text representation also has to have a segment for
+             * every segment of the presentation even when no cue falls into it,
+             * as the client derives the segment names from the timeline and
+             * 14496-30 covers the gap with an empty sample. */
+            int64_t seg_start, seg_end;
+
+            if (os->max_pts != AV_NOPTS_VALUE)
+                os->cue_end_pts = FFMAX(os->cue_end_pts, os->max_pts);
+
+            if (stream >= 0) {
+                /* Take over the time range of the segment that triggered this
+                 * flush, so that the text segments land on the timeline where
+                 * the client expects them, without an initial delay that only
+                 * an edit list could express. */
+                AVRational tb = s->streams[stream]->time_base;
+                seg_start = av_rescale_q(c->streams[stream].start_pts, tb, st->time_base);
+                seg_end   = av_rescale_q(c->streams[stream].max_pts,   tb, st->time_base);
+            } else {
+                // final flush: cover whatever is left of the cues
+                seg_start = os->max_pts != AV_NOPTS_VALUE ? os->max_pts : 0;
+                seg_end   = os->cue_end_pts;
+            }
+
+            if (seg_end <= seg_start)
+                continue; // nothing left to cover
+            os->start_pts = seg_start;
+            os->max_pts   = seg_end;
+
+            av_opt_set_int(os->ctx->priv_data, "frag_start_pts",
+                           av_rescale_q(seg_start, st->time_base, AV_TIME_BASE_Q), 0);
+            av_opt_set_int(os->ctx->priv_data, "frag_end_pts",
+                           stream >= 0 ? av_rescale_q(seg_end, st->time_base,
+                                                      AV_TIME_BASE_Q)
+                                       : AV_NOPTS_VALUE, 0);
+
+            /* Now that the segment is known, the muxer can write its header. */
+            if (!os->init_range_length && (ret = flush_init_segment(s, os)) < 0)
+                break;
+
+            /* The segment file of a text stream is opened here rather than on
+             * its first packet, as the init segment has to be written first. */
+            if (!c->single_file && (ret = dashenc_start_segment(s, os, i)) < 0)
+                break;
+        } else if (!os->packets_written) {
+            continue;
         }
 
         if (c->single_file)
@@ -1855,7 +2046,7 @@ static int dash_flush(AVFormatContext *s, int final, int stream)
         os->total_pkt_size = 0;
         os->total_pkt_duration = 0;
 
-        if (!os->bit_rate && !os->first_segment_bit_rate) {
+        if (!os->bit_rate && !os->first_segment_bit_rate && duration > 0) {
             os->first_segment_bit_rate = (int64_t) range_length * 8 * AV_TIME_BASE / duration;
         }
         add_segment(os, os->filename, os->start_pts, os->max_pts - os->start_pts, os->pos, range_length, index_length, next_exp_index);
@@ -2032,6 +2223,7 @@ static int dash_write_packet(AVFormatContext *s, AVPacket *pkt)
     }
 
     if (pkt->flags & AV_PKT_FLAG_KEY && os->packets_written &&
+        st->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE &&
         av_compare_ts(elapsed_duration, st->time_base,
                       seg_end_duration, AV_TIME_BASE_Q) >= 0) {
         if (!c->has_video || st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
@@ -2110,42 +2302,17 @@ static int dash_write_packet(AVFormatContext *s, AVPacket *pkt)
     os->total_pkt_duration += pkt->duration;
     os->last_flags = pkt->flags;
 
-    if (!os->init_range_length)
+    /* A text track has no samples of its own until they are generated for a
+     * whole segment, so its init segment is written by dash_flush(), once the
+     * segment the first cues belong to is known. */
+    if (!os->init_range_length && !is_text_in_mp4(st, os))
         flush_init_segment(s, os);
 
     //open the output context when the first frame of a segment is ready
-    if (!c->single_file && os->packets_written == 1) {
-        AVDictionary *opts = NULL;
-        const char *proto = avio_find_protocol_name(s->url);
-        int use_rename = proto && !strcmp(proto, "file");
-        if (os->segment_type == SEGMENT_TYPE_MP4)
-            write_styp(os->ctx->pb);
-        os->filename[0] = os->full_path[0] = os->temp_path[0] = '\0';
-        ff_dash_fill_tmpl_params(os->filename, sizeof(os->filename),
-                                 os->media_seg_name, pkt->stream_index,
-                                 os->segment_index, os->bit_rate, os->start_pts);
-        snprintf(os->full_path, sizeof(os->full_path), "%s%s", c->dirname,
-                 os->filename);
-        snprintf(os->temp_path, sizeof(os->temp_path),
-                 use_rename ? "%s.tmp" : "%s", os->full_path);
-        set_http_options(&opts, c);
-        ret = dashenc_io_open(s, &os->out, os->temp_path, &opts);
-        av_dict_free(&opts);
-        if (ret < 0) {
-            return handle_io_open_error(s, ret, os->temp_path);
-        }
-
-        // in streaming mode, the segments are available for playing
-        // before fully written but the manifest is needed so that
-        // clients and discover the segment filenames.
-        if (c->streaming) {
-            write_manifest(s, 0);
-        }
-
-        if (c->lhls) {
-            char *prefetch_url = use_rename ? NULL : os->filename;
-            write_hls_media_playlist(os, s, pkt->stream_index, 0, prefetch_url);
-        }
+    if (!c->single_file && os->packets_written == 1 && !is_text_in_mp4(st, os)) {
+        ret = dashenc_start_segment(s, os, pkt->stream_index);
+        if (ret < 0)
+            return ret;
     }
 
     //write out the data immediately in streaming mode
@@ -2291,6 +2458,7 @@ const FFOutputFormat ff_dash_muxer = {
     .p.extensions    = "mpd",
     .p.audio_codec   = AV_CODEC_ID_AAC,
     .p.video_codec   = AV_CODEC_ID_H264,
+    .p.subtitle_codec = AV_CODEC_ID_WEBVTT,
     .p.flags         = AVFMT_GLOBALHEADER | AVFMT_NOFILE | AVFMT_TS_NEGATIVE,
     .p.priv_class    = &dash_class,
     .priv_data_size = sizeof(DASHContext),
