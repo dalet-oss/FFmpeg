@@ -81,6 +81,8 @@ static const AVOption options[] = {
     { "encryption_kid", "The media encryption key identifier (hex)", offsetof(MOVMuxContext, encryption_kid), AV_OPT_TYPE_BINARY, .flags = AV_OPT_FLAG_ENCODING_PARAM },
     { "encryption_scheme",    "Configures the encryption scheme, allowed values are none, cenc-aes-ctr", offsetof(MOVMuxContext, encryption_scheme_str),   AV_OPT_TYPE_STRING, {.str = NULL}, .flags = AV_OPT_FLAG_ENCODING_PARAM },
     { "frag_duration", "Maximum fragment duration", offsetof(MOVMuxContext, max_fragment_duration), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM},
+    { "frag_end_pts", "Presentation time at which the fragment currently being written ends, used to time and pad subtitle tracks when no other track in the file provides fragment timing", offsetof(MOVMuxContext, frag_end_pts), AV_OPT_TYPE_INT64, {.i64 = AV_NOPTS_VALUE}, INT64_MIN, INT64_MAX, AV_OPT_FLAG_ENCODING_PARAM},
+    { "frag_start_pts", "Presentation time at which the fragment currently being written starts, see frag_end_pts", offsetof(MOVMuxContext, frag_start_pts), AV_OPT_TYPE_INT64, {.i64 = AV_NOPTS_VALUE}, INT64_MIN, INT64_MAX, AV_OPT_FLAG_ENCODING_PARAM},
     { "frag_interleave", "Interleave samples within fragments (max number of consecutive samples, lower is tighter interleaving, but with more overhead)", offsetof(MOVMuxContext, frag_interleave), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM },
     { "frag_size", "Maximum fragment size", offsetof(MOVMuxContext, max_fragment_size), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM},
     { "fragment_index", "Fragment number of the next fragment", offsetof(MOVMuxContext, fragments), AV_OPT_TYPE_INT, {.i64 = 1}, 1, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM},
@@ -6400,6 +6402,79 @@ static int mov_flush_fragment_interleaving(AVFormatContext *s, MOVTrack *track)
     return 0;
 }
 
+void ff_mov_calculate_fragment_window(AVFormatContext *s, MOVTrack *track,
+                                      int64_t *start_pts, int64_t *end_pts)
+{
+    MOVMuxContext *mov = s->priv_data;
+
+    // Initialize at the end of the previous document/fragment, which is NOPTS
+    // until the first fragment is created.
+    int64_t max_track_end_dts = *start_pts = track->end_pts;
+
+    for (unsigned int i = 0; i < s->nb_streams; i++) {
+        MOVTrack *other_track = &mov->tracks[i];
+
+        // Skip our own track, any other track that needs squashing,
+        // or any track which still has its start_dts at NOPTS or
+        // any track that did not yet get any packets.
+        if (track == other_track ||
+            other_track->squash_fragment_samples_to_one ||
+            other_track->start_dts == AV_NOPTS_VALUE ||
+            !other_track->entry) {
+            continue;
+        }
+
+        int64_t picked_start = av_rescale_q_rnd(other_track->cluster[0].dts + other_track->cluster[0].cts,
+                                                other_track->st->time_base,
+                                                track->st->time_base,
+                                                AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+        int64_t picked_end   = av_rescale_q_rnd(other_track->end_pts,
+                                                other_track->st->time_base,
+                                                track->st->time_base,
+                                                AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX);
+
+        if (*start_pts == AV_NOPTS_VALUE)
+            *start_pts = picked_start;
+        else if (picked_start >= track->end_pts)
+            *start_pts = FFMIN(*start_pts, picked_start);
+
+        max_track_end_dts = FFMAX(max_track_end_dts, picked_end);
+    }
+
+    *end_pts = max_track_end_dts;
+
+    if (*end_pts != AV_NOPTS_VALUE && *end_pts > *start_pts)
+        return;
+
+    // No other track could provide the timing of this fragment: either this is
+    // a subtitle-only file, as written per rendition by the HLS and DASH
+    // muxers, or no other track received a packet for this fragment. Use the
+    // window declared by the calling muxer, if any.
+    if (mov->frag_end_pts != AV_NOPTS_VALUE) {
+        int64_t declared_end = av_rescale_q(mov->frag_end_pts, AV_TIME_BASE_Q,
+                                            track->st->time_base);
+
+        if (*start_pts == AV_NOPTS_VALUE) {
+            if (mov->frag_start_pts != AV_NOPTS_VALUE) {
+                *start_pts = av_rescale_q(mov->frag_start_pts, AV_TIME_BASE_Q,
+                                          track->st->time_base);
+            } else {
+                const PacketListEntry *first = track->squashed_packet_queue.head;
+                *start_pts = first ? first->pkt.pts : 0;
+            }
+        }
+
+        if (declared_end > *start_pts) {
+            *end_pts = declared_end;
+            return;
+        }
+    }
+
+    // Nothing usable. Leave it to the caller to derive the timing from the
+    // packets it has, rather than handing it a zero length window.
+    *start_pts = *end_pts = AV_NOPTS_VALUE;
+}
+
 static int mov_write_squashed_packet(AVFormatContext *s, MOVTrack *track)
 {
     MOVMuxContext *mov = s->priv_data;
@@ -8694,6 +8769,10 @@ static int mov_write_trailer(AVFormatContext *s)
 
     // Check if we have any tracks that require squashing.
     // In that case, we'll have to write the packet here.
+    // The fragment window the caller declared belongs to the fragment it
+    // flushed last, so drop it and let whatever is left over be covered in
+    // full.
+    mov->frag_start_pts = mov->frag_end_pts = AV_NOPTS_VALUE;
     if ((res = mov_write_squashed_packets(s)) < 0)
         return res;
 

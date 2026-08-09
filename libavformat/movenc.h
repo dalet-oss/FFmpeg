@@ -223,6 +223,8 @@ typedef struct MOVMuxContext {
     int max_fragment_duration;
     int min_fragment_duration;
     int max_fragment_size;
+    int64_t frag_start_pts;
+    int64_t frag_end_pts;
     int ism_lookahead;
     AVIOContext *mdat_buf;
     int first_trun;
@@ -299,5 +301,24 @@ int ff_mov_add_hinted_packet(AVFormatContext *s, AVPacket *pkt,
                              int track_index, int sample,
                              uint8_t *sample_data, int sample_size);
 void ff_mov_close_hinting(MOVTrack *track);
+
+/**
+ * Calculate the presentation time window of the fragment currently being
+ * written, for tracks whose samples have to be generated to fill the fragment
+ * (subtitle tracks).
+ *
+ * The window is derived from the other tracks of the same file, as receivers
+ * expect the fragments of all tracks to be aligned. If no other track can
+ * provide it - which is the case for the subtitle-only files written per
+ * rendition by the HLS and DASH muxers - the window declared by the calling
+ * muxer through the frag_start_pts and frag_end_pts options is used instead.
+ *
+ * @param start_pts  set to the start of the window, in track time base, or
+ *                   AV_NOPTS_VALUE if it could not be determined
+ * @param end_pts    set to the end of the window, in track time base, or
+ *                   AV_NOPTS_VALUE if it could not be determined
+ */
+void ff_mov_calculate_fragment_window(AVFormatContext *s, MOVTrack *track,
+                                      int64_t *start_pts, int64_t *end_pts);
 
 #endif /* AVFORMAT_MOVENC_H */
