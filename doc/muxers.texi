@@ -2339,13 +2339,58 @@ Expected string format is like this "a:0,v:0 a:1,v:1 ....". Here a:, v:, s: are
 the keys to specify audio, video and subtitle streams respectively.
 Allowed values are 0 to 9 (limited just based on practical usage).
 
+Additional per-variant attributes may be appended as comma-separated
+@code{key:value} pairs. Supported attributes:
+
+@table @option
+@item name:@var{str}
+Assigns a name to this variant stream. The name is used in two ways:
+(1) as the substitution value for the @code{%v} and @code{%@{vn@}} filename
+template placeholders, and (2) as the @code{NAME=} attribute value in
+@code{#EXT-X-MEDIA} entries written to the master playlist for audio-only
+and subtitle-only renditions. If omitted, the variant index is used for
+filename expansion and an auto-generated @code{audio_N} / @code{subtitle_N}
+name is used in the master playlist.
+
+@item agroup:@var{str}
+Associates this variant with an audio rendition group named @var{str}. For
+audio-only variants this value is written as @code{GROUP-ID=} in the
+@code{#EXT-X-MEDIA TYPE=AUDIO} entry. For video variants it is written as
+@code{AUDIO=} in @code{#EXT-X-STREAM-INF}. The value is used exactly as
+specified; no prefix is added.
+
+The @code{URI=} attribute of an audio-only @code{#EXT-X-MEDIA} entry is
+omitted when that rendition's own media playlist is also directly referenced
+by its own @code{#EXT-X-STREAM-INF} (which happens when there is no video
+variant, or when @option{default:} is not used in @option{-var_stream_map}),
+per RFC 8216: a missing @code{URI=} on an AUDIO rendition indicates the media
+data is included in the playlist of the referencing @code{#EXT-X-STREAM-INF}.
+or example, with a single audio-only variant:
+@example
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="stream-0",DEFAULT=NO,AUTOSELECT=YES
+#EXT-X-STREAM-INF:BANDWIDTH=101403,CODECS="mp4a.40.2",AUDIO="audio"
+audio/stream-0/stream-0.m3u8
+@end example
+
+@item sgroup:@var{str}
+Associates this variant with a subtitle rendition group. Behaves analogously
+to @option{agroup:} for subtitles.
+
+@item default:yes|no
+Sets the @code{DEFAULT=} attribute for the rendition.
+
+@item language:@var{code}
+Sets the @code{LANGUAGE=} attribute for the rendition.
+@end table
+
 When there are two or more variant streams, the output filename pattern must
-contain the string "%v": this string specifies the position of variant stream
-index in the output media playlist filenames. The string "%v" may be present in
-the filename or in the last directory name containing the file. If the string is
-present in the directory name, then sub-directories are created after expanding
-the directory name pattern. This enables creation of variant streams in
-subdirectories.
+contain at least one template placeholder (@code{%v}, @code{%@{...@}}, or
+@code{%[@dots{}]}). See @ref{hls_filename_templates} for the full template
+syntax.
+
+The legacy @code{%v} placeholder may appear in the filename or in a directory
+component; if it appears in a directory component, the corresponding
+sub-directory is created automatically.
 
 A few examples follow.
 
@@ -2397,16 +2442,18 @@ ffmpeg -re -i in.ts -b:v:0 1000k -b:v:1 256k -b:a:0 64k -b:a:1 32k \
 @end example
 
 @item
-Create two audio only and two video only variant streams. In addition to the
-@code{#EXT-X-STREAM-INF} tag for each variant stream in the master playlist, the
-@code{#EXT-X-MEDIA} tag is also added for the two audio only variant streams and
-they are mapped to the two video only variant streams with audio group names
-'aud_low' and 'aud_high'.
+Create two audio-only and two video-only variant streams. The
+master playlist will contain @code{#EXT-X-MEDIA} entries with
+@code{GROUP-ID="aud_low"} / @code{GROUP-ID="aud_high"} and
+@code{NAME="audio_low"} / @code{NAME="audio_high"} for the audio renditions,
+plus @code{#EXT-X-STREAM-INF} entries with @code{AUDIO="aud_low"} /
+@code{AUDIO="aud_high"} for the video streams.
 By default, a single hls variant containing all the encoded streams is created.
 @example
 ffmpeg -re -i in.ts -b:a:0 32k -b:a:1 64k -b:v:0 1000k -b:v:1 3000k  \
   -map 0:a -map 0:a -map 0:v -map 0:v -f hls \
-  -var_stream_map "a:0,agroup:aud_low a:1,agroup:aud_high v:0,agroup:aud_low v:1,agroup:aud_high" \
+  -var_stream_map "a:0,agroup:aud_low,name:audio_low a:1,agroup:aud_high,name:audio_high \
+  v:0,agroup:aud_low v:1,agroup:aud_high" \
   -master_pl_name master.m3u8 \
   http://example.com/live/out_%v.m3u8
 @end example
@@ -2458,6 +2505,82 @@ ffmpeg -y -i input_with_subtitle.mkv \
  10 -master_pl_publish_rate 10 -hls_flags \
  delete_segments+discont_start+split_by_time ./tmp/video.m3u8
 @end example
+@end itemize
+
+@anchor{hls_filename_templates}
+@item Extended filename template syntax
+@cindex HLS filename templates
+
+Output filename paths (the @code{-i} output URL, @option{hls_segment_filename},
+and @option{hls_subtitle_path}) support an extended template syntax that allows
+producing different path structures for video, audio, and subtitle variant
+streams from a single template string.
+
+@itemize
+@item Stream-type conditional blocks
+
+@example
+%[v:@var{video_part}|a:@var{audio_part}|s:@var{subtitle_part}]
+@end example
+
+The block resolves to the section whose key (@code{v}, @code{a}, or @code{s})
+matches the type of the current variant stream. Variant streams that contain a
+video stream are type @code{v}; subtitle-only streams are type @code{s};
+audio-only streams are type @code{a}. Unmatched keys produce an empty string.
+The @code{|} and @code{]} characters are reserved inside the block.
+
+@item Named placeholders
+
+The following @code{%@{...@}} placeholders may be used inside or outside
+conditional blocks:
+
+@table @code
+@item %@{vn@}
+Applies to all variants. Variant name (@option{name:} from @option{var_stream_map}).
+@item %@{vi@}
+Applies to all variants. Variant stream index (integer).
+@item %@{an@}
+Applies to audio only. Audio group name (@option{agroup:}), falling back to
+variant name.
+@item %@{ai@}
+Applies to audio only. Variant stream index (integer).
+@item %@{sn@}
+Applies to subtitle only. Subtitle group name (@option{sgroup:}), falling
+back to variant name.
+@item %@{si@}
+Applies to subtitle only. Variant stream index (integer).
+@end table
+
+Non-applicable placeholders (e.g. @code{%@{an@}} on a video variant) expand to
+an empty string. The legacy @code{%v} placeholder (variant name or index) is
+preserved unchanged for backwards compatibility.
+
+@item Template example
+
+@example
+ffmpeg -i audio.mp4 -i video.mp4 \
+  -var_stream_map "a:0,agroup:audio,name:en v:0,agroup:audio,name:main" \
+  -master_pl_name master.m3u8 -hls_segment_type fmp4 -hls_flags single_file \
+  -hls_playlist_type vod -hls_time 4 \
+  -hls_segment_filename "%[v:video/%@{vn@}|a:audio/%@{an@}]/%@{vi@}%@{ai@}.m4s" \
+  "%[v:video/%@{vn@}|a:audio/%@{an@}]/%@{vi@}%@{ai@}.m3u8"
+@end example
+
+With variant stream index 0 for audio and 1 for video, this produces the
+playlist files @file{audio/audio/0.m3u8} (audio variant, type @code{a},
+@code{%@{an@}}="audio", @code{%@{ai@}}=0) and @file{video/main/1.m3u8} (video
+variant, type @code{v}, @code{%@{vn@}}="main", @code{%@{vi@}}=1).
+
+The master playlist will contain:
+
+@example
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="en",...,URI="audio/audio/0.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=...,AUDIO="audio",...
+video/main/1.m3u8
+@end example
+
+Sub-directories produced by template expansion are created automatically when
+writing to local files.
 @end itemize
 
 @item cc_stream_map @var{cc_stream_map}
