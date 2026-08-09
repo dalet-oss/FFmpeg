@@ -41,6 +41,8 @@ static const struct codec_string {
     { AV_CODEC_ID_VORBIS, "vorbis" },
     { AV_CODEC_ID_OPUS, "opus" },
     { AV_CODEC_ID_FLAC, "flac" },
+    // WebVTT in ISO BMFF, as defined by ISO/IEC 14496-30
+    { AV_CODEC_ID_WEBVTT, "wvtt" },
     { AV_CODEC_ID_NONE }
 };
 
