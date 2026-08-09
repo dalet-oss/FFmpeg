@@ -67,6 +67,7 @@
 #include "nal.h"
 #include "mov_chan.h"
 #include "movenc_ttml.h"
+#include "movenc_wvtt.h"
 #include "mux.h"
 #include "rawutils.h"
 #include "ttmlenc.h"
@@ -2237,7 +2238,10 @@ static int mov_write_subtitle_tag(AVFormatContext *s, AVIOContext *pb, MOVTrack 
 
     if (track->par->codec_id == AV_CODEC_ID_DVD_SUBTITLE)
         mov_write_esds_tag(pb, track);
-    else if (track->par->codec_id == AV_CODEC_ID_TTML) {
+    else if (track->par->codec_id == AV_CODEC_ID_WEBVTT) {
+        // As specified in 14496-30, WVTTSampleEntry
+        ff_mov_write_wvtt_config(pb, track);
+    } else if (track->par->codec_id == AV_CODEC_ID_TTML) {
         switch (track->par->codec_tag) {
         case MOV_ISMV_TTML_TAG:
             // ISMV dfxp requires no extradata.
@@ -6419,6 +6423,7 @@ void ff_mov_calculate_fragment_window(AVFormatContext *s, MOVTrack *track,
         // any track that did not yet get any packets.
         if (track == other_track ||
             other_track->squash_fragment_samples_to_one ||
+            other_track->flatten_subtitle_samples ||
             other_track->start_dts == AV_NOPTS_VALUE ||
             !other_track->entry) {
             continue;
@@ -6449,7 +6454,7 @@ void ff_mov_calculate_fragment_window(AVFormatContext *s, MOVTrack *track,
     // No other track could provide the timing of this fragment: either this is
     // a subtitle-only file, as written per rendition by the HLS and DASH
     // muxers, or no other track received a packet for this fragment. Use the
-    // window declared by the calling muxer, if any.
+    // fragment end declared by the calling muxer, if any.
     if (mov->frag_end_pts != AV_NOPTS_VALUE) {
         int64_t declared_end = av_rescale_q(mov->frag_end_pts, AV_TIME_BASE_Q,
                                             track->st->time_base);
@@ -6513,6 +6518,40 @@ finish_squash:
     return ret;
 }
 
+/* Generate the samples of the current fragment from the cues queued for a
+ * track, and write them out. */
+static int mov_write_flattened_packets(AVFormatContext *s, MOVTrack *track)
+{
+    PacketList samples = { 0 };
+    AVPacket *sample = NULL;
+    int ret;
+
+    if ((ret = ff_mov_generate_wvtt_samples(s, track, &samples)) < 0)
+        return ret;
+
+    if (!samples.head)
+        return 0;
+
+    if (!(sample = av_packet_alloc())) {
+        avpriv_packet_list_free(&samples);
+        return AVERROR(ENOMEM);
+    }
+
+    while (!avpriv_packet_list_get(&samples, sample)) {
+        ret = mov_write_single_packet(s, sample);
+        av_packet_unref(sample);
+        if (ret < 0)
+            break;
+    }
+
+    track->end_reliable = 1;
+
+    av_packet_free(&sample);
+    avpriv_packet_list_free(&samples);
+
+    return ret;
+}
+
 static int mov_write_squashed_packets(AVFormatContext *s)
 {
     MOVMuxContext *mov = s->priv_data;
@@ -6521,16 +6560,25 @@ static int mov_write_squashed_packets(AVFormatContext *s)
         MOVTrack *track = &mov->tracks[i];
         int ret = AVERROR_BUG;
 
-        if (track->squash_fragment_samples_to_one && !track->entry) {
-            if ((ret = mov_write_squashed_packet(s, track)) < 0) {
-                av_log(s, AV_LOG_ERROR,
-                       "Failed to write squashed packet for %s stream with "
-                       "index %d and track id %d. Error: %s\n",
-                       avcodec_get_name(track->st->codecpar->codec_id),
-                       track->st->index, track->track_id,
-                       av_err2str(ret));
-                return ret;
-            }
+        if (track->entry)
+            continue;
+
+        if (track->squash_fragment_samples_to_one) {
+            ret = mov_write_squashed_packet(s, track);
+        } else if (track->flatten_subtitle_samples) {
+            ret = mov_write_flattened_packets(s, track);
+        } else {
+            continue;
+        }
+
+        if (ret < 0) {
+            av_log(s, AV_LOG_ERROR,
+                   "Failed to write squashed packet for %s stream with "
+                   "index %d and track id %d. Error: %s\n",
+                   avcodec_get_name(track->st->codecpar->codec_id),
+                   track->st->index, track->track_id,
+                   av_err2str(ret));
+            return ret;
         }
     }
 
@@ -7127,7 +7175,7 @@ int ff_mov_write_packet(AVFormatContext *s, AVPacket *pkt)
     trk->cluster[trk->entry].entries          = samples_in_chunk;
     trk->cluster[trk->entry].dts              = pkt->dts;
     trk->cluster[trk->entry].pts              = pkt->pts;
-    if (!trk->squash_fragment_samples_to_one &&
+    if (!trk->squash_fragment_samples_to_one && !trk->flatten_subtitle_samples &&
         !trk->entry && trk->start_dts != AV_NOPTS_VALUE) {
         if (!trk->frag_discont) {
             /* First packet of a new fragment. We already wrote the duration
@@ -7516,10 +7564,11 @@ static int mov_write_packet(AVFormatContext *s, AVPacket *pkt)
             }
         }
 
-        if (trk->squash_fragment_samples_to_one) {
+        if (trk->squash_fragment_samples_to_one || trk->flatten_subtitle_samples) {
             /*
-             * If the track has to have its samples squashed into one sample,
-             * we just take it into the track's queue.
+             * If the track has to have its samples squashed into one sample, or
+             * its samples generated from the cues it receives, we just take it
+             * into the track's queue.
              * This will then be utilized as the samples get written in either
              * mov_flush_fragment or when the mux is finalized in
              * mov_write_trailer.
@@ -8425,6 +8474,21 @@ static int mov_init(AVFormatContext *s)
                            "'-strict unofficial' if you want to use it.\n");
                     return AVERROR_EXPERIMENTAL;
                 }
+            } else if (track->par->codec_id == AV_CODEC_ID_WEBVTT) {
+                /* 14496-30 has the samples of a WebVTT track cover its whole
+                   timeline without overlapping each other, which does not match
+                   the cues we receive. They are queued and turned into samples
+                   per fragment instead, for which we define a per-track flag. */
+                track->flatten_subtitle_samples = 1;
+
+                if (track->par->codec_tag != MOV_MP4_WEBVTT_TAG) {
+                    av_log(s, AV_LOG_ERROR,
+                           "Unknown codec tag '%s' utilized for WebVTT stream "
+                           "with index %d (track id %d)!\n",
+                           av_fourcc2str(track->par->codec_tag), st->index,
+                           track->track_id);
+                    return AVERROR(EINVAL);
+                }
             }
         } else if (st->codecpar->codec_type == AVMEDIA_TYPE_DATA) {
             track->timescale = st->time_base.den;
@@ -9003,6 +9067,7 @@ static const AVCodecTag codec_mp4_tags[] = {
     { AV_CODEC_ID_MPEGH_3D_AUDIO,  MKTAG('m', 'h', 'm', '1') },
     { AV_CODEC_ID_TTML,            MOV_MP4_TTML_TAG          },
     { AV_CODEC_ID_TTML,            MOV_ISMV_TTML_TAG         },
+    { AV_CODEC_ID_WEBVTT,          MOV_MP4_WEBVTT_TAG        },
     { AV_CODEC_ID_FFV1,            MKTAG('F', 'F', 'V', '1') },
 
     /* ISO/IEC 23003-5 integer formats */

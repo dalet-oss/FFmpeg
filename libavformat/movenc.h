@@ -176,6 +176,7 @@ typedef struct MOVTrack {
     int is_unaligned_qt_rgb;
 
     unsigned int squash_fragment_samples_to_one; //< flag to note formats where all samples for a fragment are to be squashed
+    unsigned int flatten_subtitle_samples; //< flag to note formats where the samples of a fragment are generated from the queued cues
 
     PacketList squashed_packet_queue;
 
@@ -310,8 +311,8 @@ void ff_mov_close_hinting(MOVTrack *track);
  * The window is derived from the other tracks of the same file, as receivers
  * expect the fragments of all tracks to be aligned. If no other track can
  * provide it - which is the case for the subtitle-only files written per
- * rendition by the HLS and DASH muxers - the window declared by the calling
- * muxer through the frag_start_pts and frag_end_pts options is used instead.
+ * rendition by the HLS and DASH muxers - the fragment end declared by the
+ * calling muxer through the frag_end_pts option is used instead.
  *
  * @param start_pts  set to the start of the window, in track time base, or
  *                   AV_NOPTS_VALUE if it could not be determined
