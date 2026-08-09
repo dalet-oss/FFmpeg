@@ -435,6 +435,16 @@ configure the encryption scheme, allowed values are @samp{none}, and
 @item frag_duration @var{duration}
 Create fragments that are @var{duration} microseconds long.
 
+@item frag_start_pts @var{pts}
+@item frag_end_pts @var{pts}
+Declare the presentation time range, in microseconds, covered by the fragment
+that is written next. A subtitle track has its samples generated to cover the
+whole fragment, and takes the range from the other tracks of the file, so these
+options are only needed for a file that has nothing but a subtitle track in it,
+as written per rendition by the HLS and DASH muxers. They are meant to be set
+again before every flush, and are ignored by tracks that carry samples of their
+own.
+
 @item frag_interleave  @var{number}
 Interleave samples within fragments (max number of consecutive
 samples, lower is tighter interleaving, but with more overhead. It is
