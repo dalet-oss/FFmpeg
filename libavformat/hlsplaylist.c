@@ -39,25 +39,36 @@ void ff_hls_write_playlist_version(AVIOContext *out, int version)
 
 void ff_hls_write_audio_rendition(AVIOContext *out, const char *agroup,
                                   const char *filename, const char *language,
-                                  int name_id, int is_default, int nb_channels)
+                                  const char *aname, int name_id, int is_default, int nb_channels,
+                                  int is_autoselect, int omit_uri)
 {
     if (!out || !agroup || !filename)
         return;
 
-    avio_printf(out, "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"group_%s\"", agroup);
-    avio_printf(out, ",NAME=\"audio_%d\",DEFAULT=%s,", name_id, is_default ? "YES" : "NO");
+    avio_printf(out, "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"%s\"", agroup);
+    if (aname) {
+        avio_printf(out, ",NAME=\"%s\"", aname);
+    } else {
+        avio_printf(out, ",NAME=\"audio_%d\"", name_id);
+    }
+    avio_printf(out, ",DEFAULT=%s", is_default ? "YES" : "NO");
     if (language) {
-        avio_printf(out, "LANGUAGE=\"%s\",", language);
+        avio_printf(out, ",LANGUAGE=\"%s\"", language);
     }
     if (nb_channels) {
-        avio_printf(out, "CHANNELS=\"%d\",", nb_channels);
+        avio_printf(out, ",CHANNELS=\"%d\"", nb_channels);
     }
-    avio_printf(out, "URI=\"%s\"\n", filename);
+    if (is_autoselect)
+        avio_printf(out, ",AUTOSELECT=YES");
+    if (!omit_uri)
+        avio_printf(out, ",URI=\"%s\"", filename);
+    avio_printf(out, "\n");
 }
 
 void ff_hls_write_subtitle_rendition(AVIOContext *out, const char *sgroup,
                                      const char *filename, const char *language,
-                                     const char *sname, int name_id, int is_default)
+                                     const char *sname, int name_id, int is_default,
+                                     int is_autoselect)
 {
     if (!out || !filename)
         return;
@@ -72,6 +83,8 @@ void ff_hls_write_subtitle_rendition(AVIOContext *out, const char *sgroup,
     if (language) {
         avio_printf(out, "LANGUAGE=\"%s\",", language);
     }
+    if (is_autoselect)
+        avio_printf(out, "AUTOSELECT=YES,");
     avio_printf(out, "URI=\"%s\"\n", filename);
 }
 
@@ -84,11 +97,10 @@ void ff_hls_write_stream_info(AVStream *st, AVIOContext *out, int bandwidth,
     if (!out || !filename)
         return;
 
-    if (!bandwidth) {
+    if (!bandwidth)
         av_log(NULL, AV_LOG_WARNING,
-                "Bandwidth info not available, set audio and video bitrates\n");
-        return;
-    }
+                "Bandwidth info not available for '%s'; writing BANDWIDTH=0. "
+                "Set input bitrates or use -b:v/-b:a for accurate output.\n", filename);
 
     avio_printf(out, "#EXT-X-STREAM-INF:BANDWIDTH=%d", bandwidth);
     if (avg_bandwidth)
@@ -99,11 +111,15 @@ void ff_hls_write_stream_info(AVStream *st, AVIOContext *out, int bandwidth,
     if (codecs && codecs[0])
         avio_printf(out, ",CODECS=\"%s\"", codecs);
     if (agroup && agroup[0])
-        avio_printf(out, ",AUDIO=\"group_%s\"", agroup);
+        avio_printf(out, ",AUDIO=\"%s\"", agroup);
     if (ccgroup && ccgroup[0])
         avio_printf(out, ",CLOSED-CAPTIONS=\"%s\"", ccgroup);
+    else if (st)
+        avio_printf(out, ",CLOSED-CAPTIONS=NONE");
     if (sgroup && sgroup[0])
         avio_printf(out, ",SUBTITLES=\"%s\"", sgroup);
+    if (st && st->avg_frame_rate.num > 0 && st->avg_frame_rate.den > 0)
+        avio_printf(out, ",FRAME-RATE=%.3f", av_q2d(st->avg_frame_rate));
     avio_printf(out, "\n%s\n\n", filename);
 }
 
