@@ -176,6 +176,7 @@ typedef struct DASHContext {
     const char *utc_timing_url;
     const char *method;
     const char *user_agent;
+    char *cookies;
     AVDictionary *http_opts;
     int hls_playlist;
     const char *hls_master_name;
@@ -385,6 +386,8 @@ static void set_http_options(AVDictionary **options, DASHContext *c)
     av_dict_copy(options, c->http_opts, 0);
     if (c->user_agent)
         av_dict_set(options, "user_agent", c->user_agent, 0);
+    if (c->cookies)
+        av_dict_set(options, "cookies", c->cookies, 0);
     if (c->http_persistent)
         av_dict_set_int(options, "multiple_requests", 1, 0);
     if (c->timeout >= 0)
@@ -2426,6 +2429,7 @@ static int dash_check_bitstream(AVFormatContext *s, AVStream *st,
 #define E AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption options[] = {
     { "adaptation_sets", "Adaptation sets. Syntax: id=0,streams=0,1,2 id=1,streams=3,4 and so on", OFFSET(adaptation_sets), AV_OPT_TYPE_STRING, { 0 }, 0, 0, AV_OPT_FLAG_ENCODING_PARAM },
+    { "cookies", "set cookies to be sent in HTTP requests", OFFSET(cookies), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, E },
     { "dash_segment_type", "set dash segment files type", OFFSET(segment_type_option), AV_OPT_TYPE_INT, {.i64 = SEGMENT_TYPE_AUTO }, 0, SEGMENT_TYPE_NB - 1, E, .unit = "segment_type"},
         { "auto", "select segment file format based on codec", 0, AV_OPT_TYPE_CONST, {.i64 = SEGMENT_TYPE_AUTO }, 0, UINT_MAX,   E, .unit = "segment_type"},
         { "mp4", "make segment file in ISOBMFF format", 0, AV_OPT_TYPE_CONST, {.i64 = SEGMENT_TYPE_MP4 }, 0, UINT_MAX,   E, .unit = "segment_type"},
