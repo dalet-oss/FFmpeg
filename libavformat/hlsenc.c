@@ -617,7 +617,9 @@ static int hlsenc_io_close(AVFormatContext *s, AVIOContext **pb, char *filename)
     if (!*pb)
         return ret;
     if (!http_base_proto || !hls->http_persistent || hls->key_info_file || hls->encrypt) {
-        ff_format_io_close(s, pb);
+        /* A write over HTTP is only rejected once the request body is complete, so close is where
+         * the failure of everything written to this file is reported. */
+        ret = ff_format_io_close(s, pb);
 #if CONFIG_HTTP_PROTOCOL
     } else {
         URLContext *http_url_context = ffio_geturlcontext(*pb);
@@ -1798,7 +1800,11 @@ static int create_master_playlist(AVFormatContext *s,
 fail:
     if (ret >=0)
         hls->master_m3u8_created = 1;
-    hlsenc_io_close(s, &hls->m3u8_out, temp_filename);
+    {
+        int close_ret = hlsenc_io_close(s, &hls->m3u8_out, temp_filename);
+        if (ret >= 0)
+            ret = close_ret;
+    }
     if (use_temp_file)
         ff_rename(temp_filename, hls->master_m3u8_url, s);
 
