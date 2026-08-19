@@ -99,6 +99,9 @@ typedef struct HTTPContext {
     int end_chunked_post;
     /* A flag which indicates we have finished to read POST reply. */
     int end_header;
+    /* A flag which indicates the reply to a request whose body we are still sending, or have just
+     * finished sending, has not been read yet. */
+    int reply_pending;
     /* A flag which indicates if we use persistent connections. */
     int multiple_requests;
     uint8_t *post_data;
@@ -1666,6 +1669,7 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
     s->willclose        = 0;
     s->end_chunked_post = 0;
     s->end_header       = 0;
+    s->reply_pending    = 0;
 #if CONFIG_ZLIB
     s->compressed       = 0;
 #endif
@@ -1674,6 +1678,7 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
          * we've still to send the POST data, but the code calling this
          * function will check http_code after we return. */
         s->http_code = 200;
+        s->reply_pending = 1;
         err = 0;
         goto done;
     }
@@ -1688,6 +1693,11 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
     s->nb_requests++;
     s->sum_latency += latency;
     s->max_latency = FFMAX(s->max_latency, latency);
+
+    /* An accepted Expect: 100-continue is only an interim reply, the one reporting whether the
+     * write succeeded still follows the body. */
+    if (post && !s->post_data && s->http_code == 100)
+        s->reply_pending = 1;
 
     if (s->new_location)
         s->off = off;
@@ -2023,6 +2033,48 @@ static int http_write(URLContext *h, const uint8_t *buf, int size)
     return size;
 }
 
+/**
+ * Read the reply to a request whose body has just been completed.
+ *
+ * http_connect() cannot read it when the request is made, as the server only replies once it has
+ * received the body, so it pretends the request succeeded. Without reading the reply here, a
+ * rejected write - a 404 from a server which does not accept the method, a 403 from an expired
+ * pre-signed URL, a 500 from a broken back end - is silently accepted as a successful write and the
+ * caller is told it wrote a file which does not exist.
+ */
+static int http_read_write_reply(URLContext *h)
+{
+    HTTPContext *s = h->priv_data;
+    uint8_t buf[1024];
+    int ret;
+
+    s->reply_pending = 0;
+
+    ret = http_read_header(h);
+    if (ret < 0)
+        return ret;
+
+    /* check_http_code() lets 401 and 407 through so that the headers naming the accepted
+     * authentication can be parsed, but the body has already been sent, so there is nothing left to
+     * retry the request with. */
+    if (s->http_code >= 400) {
+        av_log(h, AV_LOG_ERROR, "HTTP error %d writing to %s\n", s->http_code, s->location);
+        return ff_http_averror(s->http_code, AVERROR(EIO));
+    }
+
+    /* Discard the reply body so that a connection which is going to be reused is left positioned at
+     * the start of the next reply. */
+    if (s->multiple_requests) {
+        while (s->hd && !s->chunkend) {
+            ret = http_buf_read(h, buf, sizeof(buf));
+            if (ret <= 0)
+                break;
+        }
+    }
+
+    return 0;
+}
+
 static int http_shutdown(URLContext *h, int flags)
 {
     int ret = 0;
@@ -2034,18 +2086,9 @@ static int http_shutdown(URLContext *h, int flags)
         ((flags & AVIO_FLAG_READ) && s->chunked_post && s->listen)) {
         ret = ffurl_write(s->hd, footer, sizeof(footer) - 1);
         ret = ret > 0 ? 0 : ret;
-        /* flush the receive buffer when it is write only mode */
-        if (!(flags & AVIO_FLAG_READ)) {
-            char buf[1024];
-            int read_ret;
-            s->hd->flags |= AVIO_FLAG_NONBLOCK;
-            read_ret = ffurl_read(s->hd, buf, sizeof(buf));
-            s->hd->flags &= ~AVIO_FLAG_NONBLOCK;
-            if (read_ret < 0 && read_ret != AVERROR(EAGAIN)) {
-                av_log(h, AV_LOG_ERROR, "URL read error: %s\n", av_err2str(read_ret));
-                ret = read_ret;
-            }
-        }
+        /* read the reply now the request body is complete, as its status has not been checked yet */
+        if (ret >= 0 && s->reply_pending && !s->listen)
+            ret = http_read_write_reply(h);
         s->end_chunked_post = 1;
     }
 
