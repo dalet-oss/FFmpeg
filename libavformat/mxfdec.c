@@ -46,26 +46,40 @@
 
 #include <inttypes.h>
 #include <time.h>
+#include <stdio.h>
+#include <errno.h>
 
 #include "libavutil/aes.h"
 #include "libavutil/avstring.h"
 #include "libavutil/mastering_display_metadata.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/mem.h"
+#include "libavcodec/avcodec.h"
 #include "libavcodec/bytestream.h"
 #include "libavcodec/defs.h"
+#include "libavcodec/h264_parse.h"
 #include "libavcodec/internal.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/parseutils.h"
 #include "libavutil/timecode.h"
 #include "libavutil/opt.h"
+#include "libavutil/time.h"
+#include "libavutil/file_open.h"
 #include "avformat.h"
 #include "avlanguage.h"
 #include "avio_internal.h"
 #include "demux.h"
 #include "internal.h"
 #include "mxf.h"
+#include "url.h"
+
+#if HAVE_UNISTD_H
+#include <unistd.h>
+#endif
+#if HAVE_FCNTL
+#include <fcntl.h>
+#endif
 
 #define MXF_MAX_CHUNK_SIZE (32 << 20)
 #define RUN_IN_MAX (65535+1)  // S377m-2004 section 5.5 and S377-1-2009 section 6.5, the +1 is to be slightly more tolerant
@@ -110,6 +124,7 @@ typedef struct MXFPartition {
     int64_t index_byte_count;
     int pack_length;
     int64_t pack_ofs;               ///< absolute offset of pack in file, including run-in
+    int64_t pack_value_ofs;         ///< absolute offset of the first VALUE byte of the pack
     int64_t body_offset;
     KLVPacket first_essence_klv;
 } MXFPartition;
@@ -291,6 +306,31 @@ typedef struct MXFEssenceContainerData {
     int body_sid;
 } MXFEssenceContainerData;
 
+typedef struct MXFGrowingIndex {
+    int64_t  nb_entries;
+    int64_t  entries_alloc;
+    int64_t *offsets;
+    int32_t *sizes;
+    int8_t  *temporal_offsets;
+    uint8_t *flags;
+    /* running minimum of temporal_offsets[] seen so far by
+     * mxf_growing_set_reordered_pts(); see that function's comment for why
+     * this is a minimum here and not the negated maximum
+     * mxf_compute_ptses_fake_index() uses. */
+    int8_t   min_temporal_offset;
+} MXFGrowingIndex;
+
+/* Explicit role of this process with respect to a growing MXF's sidecar
+ * index: at most one process ever holds WRITER (the fcntl() write lock on
+ * growing_index_file); every other concurrent opener is a READER, which
+ * trusts the sidecar the writer maintains and never independently measures
+ * stride or indexes the reference track itself. */
+enum MXFGrowingRole {
+    MXF_GROWING_ROLE_NONE = 0,
+    MXF_GROWING_ROLE_WRITER,
+    MXF_GROWING_ROLE_READER,
+};
+
 /* decoded index table */
 typedef struct MXFIndexTable {
     int index_sid;
@@ -329,6 +369,57 @@ typedef struct MXFContext {
     MXFIndexTable *index_tables;
     int eia608_extract;
     int skip_essence_parse;
+    /* growing MXF support - see the block comment above
+     * mxf_growing_select_ref_stream() */
+    int         growing;                    ///< derived: growing_index_file set and no footer at open
+    int         growing_poll_us;            ///< AVOption
+    int64_t     growing_timeout_us;         ///< AVOption, 0 = wait forever
+    int64_t     growing_index_stall_us;     ///< AVOption: reader's takeover-attempt threshold
+    char       *growing_index_file;         ///< AVOption
+    enum MXFGrowingRole growing_role;       ///< NONE / WRITER / READER
+    int         growing_refused;            ///< sticky: mxf_growing_refuse_incompatible_essence()
+    int         growing_ref_stream;         ///< reference stream index, -1 = none
+    int         growing_clip_wrapped;       ///< reference track is ClipWrapped
+    int64_t     growing_essence_offset;     ///< reference track's first essence element
+    int64_t     growing_stride;             ///< bytes per reference edit unit, 0 = unknown
+    int64_t     growing_elem_size;          ///< reference element size; == stride when clip-wrapped
+    int         growing_stride_done;        ///< stride measurement has been attempted
+    int         growing_stride_nb_obs;
+    int64_t     growing_stride_obs[3];
+    int64_t     growing_last_progress_us;       ///< writer: av_gettime_relative() at last essence progress
+    int64_t     growing_last_index_progress_us; ///< reader: av_gettime_relative() at last sidecar advancement
+    int64_t     growing_last_takeover_try_us;   ///< reader: throttles takeover attempts to once per growing_index_stall_us
+    int64_t     growing_last_probe_us;      ///< av_gettime_relative() at last footer probe
+    int64_t     growing_last_size;          ///< avio_size() at last observed growth
+    int         growing_timed_out;          ///< sticky
+    int         growing_file_closed;        ///< monotone 0 -> 1
+    int64_t     growing_footer_offset;      ///< footer offset relative to run_in
+    int64_t     growing_cur_duration;       ///< last published duration
+    int64_t     growing_cp_start_offset;    ///< earliest KLV offset seen since the last content package boundary, -1 = none (OP1a offset fix)
+    FILE       *growing_index_out;          ///< NULL = read-only or no sidecar
+    int64_t     growing_index_entries_written;
+    MXFGrowingIndex *growing_vbr_index;
+    int64_t     growing_sidecar_duration;   ///< reader: last duration value read from the sidecar header
+    int64_t     growing_index_resume_ofs;   ///< offset that (re)arms appending: first-time-writer start, or takeover/restart resume point
+    int         growing_index_armed;
+    int64_t     growing_index_last_ofs;     ///< offset of the last appended entry
+    int         growing_index_disabled;     ///< sticky
+    /* H.264/MPEG-2 elementary-stream reorder state (see mxf_growing_set_reordered_pts()).
+     * growing_h264.poc is unused: the stock H.264 parser (growing_h264_parser
+     * below) owns its own internal H264POCContext, so there is no hand-rolled
+     * POC state machine to keep here - see mxf_growing_index_h264_temporal_offset(). */
+    struct {
+        H264POCContext poc;
+        int64_t         gop_start_edit_unit;
+        int             idr_poc;
+        int             prev_poc;    ///< previous picture's raw output_picture_number, for poc_scale inference
+        int             poc_scale;   ///< measured GCD of observed |POC deltas|, 0 = not yet known
+        int             seen_idr;    ///< an IDR has been observed since open/resume; gop_start_edit_unit/idr_poc are valid
+    } growing_h264;
+    AVCodecParserContext *growing_h264_parser;  ///< av_parser_init(AV_CODEC_ID_H264), one per growing read (single reference track)
+    AVCodecContext       *growing_h264_avctx;   ///< dummy context for growing_h264_parser, from the ref stream's codecpar
+    int64_t     growing_mpeg2_gop_start_edit_unit;
+    int         growing_mpeg2_seen_gop;  ///< a group_start_code has been observed since open/takeover/restart; gop_start_edit_unit is valid
 } MXFContext;
 
 /* NOTE: klv_offset is not set (-1) for local keys */
@@ -797,6 +888,7 @@ static int mxf_read_partition_pack(void *arg, AVIOContext *pb, int tag, int size
     memset(partition, 0, sizeof(*partition));
     mxf->partitions_count++;
     partition->pack_length = avio_tell(pb) - klv_offset + size;
+    partition->pack_value_ofs = avio_tell(pb);
     partition->pack_ofs    = klv_offset;
 
     switch(uid[13]) {
@@ -1626,6 +1718,14 @@ static int mxf_match_uid(const UID key, const uint8_t uid_prefix[], int len)
             return 0;
     }
     return 1;
+}
+
+/* the essence element keys mxf_read_packet() dispatches on */
+static int mxf_is_essence_element_key(const UID key)
+{
+    return mxf_match_uid(key, mxf_essence_element_key, 12) ||
+           IS_KLV_KEY(key, mxf_canopus_essence_element_key) ||
+           IS_KLV_KEY(key, mxf_avid_essence_element_key);
 }
 
 static const MXFCodecUL *mxf_get_codec_ul(const MXFCodecUL *uls, UID *uid)
@@ -3671,8 +3771,18 @@ static void mxf_compute_essence_containers(AVFormatContext *s)
             p->essence_offset = p->first_essence_klv.offset;
 
             /* essence container spans to the next partition */
-            if (x < mxf->partitions_count - 1)
+            if (x < mxf->partitions_count - 1) {
                 p->essence_length = mxf->partitions[x+1].pack_ofs - mxf->run_in - p->essence_offset;
+            } else if (mxf->growing && x == mxf->partitions_count - 1) {
+                /* growing: the current file size is the upper bound. No
+                 * avio_tell() fallback - at this point the cursor is at
+                 * essence_offset, so it would yield 0 dressed up as a computed
+                 * length, and both mxf_absolute_bodysid_offset() and
+                 * mxf_essence_container_end() already treat 0 as "unknown".
+                 * mxf_growing_refresh_duration() keeps this up to date. */
+                int64_t fs = avio_size(s->pb);
+                p->essence_length = fs > p->essence_offset ? fs - p->essence_offset : 0;
+            }
 
             if (p->essence_length < 0) {
                 /* next ThisPartition < essence_offset */
@@ -3797,6 +3907,1868 @@ static int mxf_handle_missing_index_segment(MXFContext *mxf, AVStream *st)
     return 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * Growing (open) MXF support.
+ *
+ * A growing MXF is one still being written: it has no footer partition, and
+ * usually an Open header partition (which is what ffmpeg's own muxer writes
+ * for the whole life of the file - see mxfenc.c header_open_partition_key).
+ * The header partition status is NOT a reliable growing indicator; the absence
+ * of a footer is.
+ *
+ * In growing mode the demuxer reports a live duration, blocks at end-of-data
+ * instead of returning EOF, resumes when the file grows, and optionally
+ * maintains a sidecar index file so another process can read the current
+ * duration with a single stat().
+ *
+ * Everything here is expressed in edit units of a single "reference track":
+ * the first video stream, else the first audio stream, else stream 0.
+ * ------------------------------------------------------------------------- */
+
+#define MXF_GROWING_FOOTER_PROBE_US  1000000 /* footer probe cadence */
+#define MXF_GROWING_SLEEP_SLICE_US    100000 /* interrupt responsiveness */
+#define MXF_GROWING_STRIDE_SCAN_KLVS     256 /* bound on the stride walk */
+
+#define MXF_GIDX_HEADER_SIZE  64
+#define MXF_GIDX_ENTRY_SIZE   16
+#define MXF_GIDX_FLAG_DENSE 0x01 /* entries are reference-track edit-unit dense */
+#define MXF_GIDX_FLAG_KEY   0x40 /* SMPTE 377 random-access flag */
+
+typedef enum MXFWaitResult {
+    MXF_WAIT_RETRY = 0,   /* slept; re-test your predicate */
+    MXF_WAIT_FINALIZED,   /* a footer exists; re-test once, then stop */
+    MXF_WAIT_TIMEOUT,     /* growing_timeout_us elapsed since last progress */
+    MXF_WAIT_INTERRUPT,   /* ff_check_interrupt() fired */
+    MXF_WAIT_ERROR,       /* could not restore the AVIO position */
+    MXF_WAIT_ROLE_CHANGED, /* reader took over as writer (or vice versa via a
+                            * lost race); the AVIO position now sits at the
+                            * new role's resume point, not the caller's saved
+                            * position - only mxf_growing_reader_wait_step()
+                            * returns this */
+} MXFWaitResult;
+
+static void mxf_read_random_index_pack(AVFormatContext *s);  /* forward decl */
+static void mxf_growing_patch_sidecar_header(AVFormatContext *s);
+static int  mxf_growing_reload_sidecar(AVFormatContext *s);
+static void mxf_growing_patch_sidecar_duration(AVFormatContext *s, int64_t dur);
+static int  mxf_growing_open_sidecar_read(AVFormatContext *s);
+static int  mxf_growing_open_sidecar_write(AVFormatContext *s, int start_fresh);
+static int  mxf_growing_probe_footer(AVFormatContext *s);
+static int  mxf_growing_reader_wait_step(AVFormatContext *s);
+
+static MXFTrack *mxf_growing_ref_track(AVFormatContext *s)
+{
+    MXFContext *mxf = s->priv_data;
+
+    if (mxf->growing_ref_stream < 0 || mxf->growing_ref_stream >= s->nb_streams)
+        return NULL;
+    return s->streams[mxf->growing_ref_stream]->priv_data;
+}
+
+static void mxf_growing_note_progress(MXFContext *mxf)
+{
+    mxf->growing_last_progress_us = av_gettime_relative();
+}
+
+/**
+ * Pick the reference track: first video stream, else first audio, else the
+ * first stream with a track attached.
+ */
+static void mxf_growing_select_ref_stream(AVFormatContext *s)
+{
+    MXFContext *mxf = s->priv_data;
+    static const enum AVMediaType want[2] = { AVMEDIA_TYPE_VIDEO, AVMEDIA_TYPE_AUDIO };
+
+    mxf->growing_ref_stream = -1;
+    for (int w = 0; w < 2; w++) {
+        for (int i = 0; i < s->nb_streams; i++) {
+            if (s->streams[i]->priv_data &&
+                s->streams[i]->codecpar->codec_type == want[w]) {
+                mxf->growing_ref_stream = i;
+                return;
+            }
+        }
+    }
+    for (int i = 0; i < s->nb_streams; i++) {
+        if (s->streams[i]->priv_data) {
+            mxf->growing_ref_stream = i;
+            return;
+        }
+    }
+}
+
+/**
+ * Measure the byte stride of one edit unit of the reference track and record
+ * the offset of its first essence element.
+ *
+ * Walks essence KLVs forward from scan_from, accepting only elements of the
+ * reference stream, so KLV fill items, system items, index table segments and
+ * other tracks' elements are all skipped. The AVIO position is restored on
+ * every exit path.
+ */
+static int mxf_growing_measure_stride(AVFormatContext *s, int64_t scan_from)
+{
+    MXFContext *mxf = s->priv_data;
+    int64_t saved = avio_tell(s->pb);
+    int64_t starts[3], sizes[3];
+    int n = 0, scanned = 0;
+    int ret = 0;
+
+    /* only the writer measures the stride - a reader trusts the sidecar the
+     * writer maintains, and this seeks (destroying the demux cursor if
+     * called from anywhere but header-time setup) */
+    if (mxf->growing_role != MXF_GROWING_ROLE_WRITER)
+        return 0;
+
+    if (avio_seek(s->pb, scan_from, SEEK_SET) < 0) {
+        avio_seek(s->pb, saved, SEEK_SET);
+        return AVERROR(EIO);
+    }
+
+    while (n < 3 && scanned++ < MXF_GROWING_STRIDE_SCAN_KLVS) {
+        KLVPacket klv;
+
+        if (klv_read_packet(mxf, &klv, s->pb) < 0)
+            break;
+        if (mxf_is_essence_element_key(klv.key)) {
+            int body_sid = find_body_sid_by_absolute_offset(mxf, klv.offset);
+            if (mxf_get_stream_index(s, &klv, body_sid) == mxf->growing_ref_stream) {
+                starts[n] = klv.offset;
+                sizes[n]  = klv.next_klv - klv.offset;
+                n++;
+            }
+        }
+        if (avio_seek(s->pb, klv.next_klv, SEEK_SET) < 0)
+            break;
+    }
+
+    if (n > 0)
+        mxf->growing_essence_offset = starts[0];
+
+    if (n == 3) {
+        int64_t s01 = starts[1] - starts[0];
+        int64_t s12 = starts[2] - starts[1];
+
+        mxf->growing_stride_done = 1;
+        if (s01 > 0 && s01 == s12) {
+            mxf->growing_stride    = s01;
+            mxf->growing_elem_size = sizes[0];
+            av_log(s, AV_LOG_DEBUG, "growing MXF: measured CBR stride %"PRId64
+                   " (element %"PRId64" bytes) from 0x%"PRIx64"\n",
+                   s01, sizes[0], starts[0]);
+        } else {
+            av_log(s, AV_LOG_VERBOSE, "growing MXF: reference track is not CBR "
+                   "(stride %"PRId64" then %"PRId64"); duration will come from "
+                   "the sidecar index\n", s01, s12);
+        }
+    }
+
+    if (avio_seek(s->pb, saved, SEEK_SET) < 0)
+        ret = AVERROR(EIO);
+    return ret;
+}
+
+/**
+ * Learn the reference track's stride from KLVs the read path is already
+ * walking. Does no I/O and no seeking, so it is safe to call per packet - the
+ * header-time measurement fails on a file that has fewer than three edit units
+ * when it is opened.
+ */
+static void mxf_growing_observe_klv(AVFormatContext *s, KLVPacket *klv,
+                                    int stream_index)
+{
+    MXFContext *mxf = s->priv_data;
+    int n;
+
+    if (mxf->growing_role != MXF_GROWING_ROLE_WRITER)
+        return;
+    if (mxf->growing_stride_done || stream_index != mxf->growing_ref_stream)
+        return;
+
+    n = mxf->growing_stride_nb_obs;
+    if (n > 0 && klv->offset <= mxf->growing_stride_obs[n - 1])
+        return;                     /* re-read after a seek: do not mix offsets */
+    if (n >= 3)
+        return;
+    mxf->growing_stride_obs[n] = klv->offset;
+    mxf->growing_stride_nb_obs = ++n;
+
+    if (n == 3) {
+        int64_t s01 = mxf->growing_stride_obs[1] - mxf->growing_stride_obs[0];
+        int64_t s12 = mxf->growing_stride_obs[2] - mxf->growing_stride_obs[1];
+
+        mxf->growing_stride_done = 1;
+        if (s01 > 0 && s01 == s12) {
+            mxf->growing_stride         = s01;
+            mxf->growing_essence_offset = mxf->growing_stride_obs[0];
+            mxf->growing_elem_size      = klv->next_klv - klv->offset;
+            av_log(s, AV_LOG_DEBUG, "growing MXF: observed CBR stride %"PRId64"\n",
+                   s01);
+            mxf_growing_patch_sidecar_header(s);
+        } else {
+            av_log(s, AV_LOG_VERBOSE, "growing MXF: reference track is not CBR; "
+                   "duration will come from the sidecar index\n");
+        }
+    }
+}
+
+/**
+ * Number of complete reference-track edit units currently present.
+ * Returns AV_NOPTS_VALUE when it cannot be determined.
+ *
+ * Note there is deliberately no avio_tell() fallback when avio_size() is
+ * unavailable: as a seek-availability metric that would report "available ==
+ * already consumed" and make every forward seek block forever.
+ */
+static int64_t mxf_growing_compute_duration(AVFormatContext *s)
+{
+    MXFContext *mxf = s->priv_data;
+    int64_t fs, avail;
+
+    /* a reader never derives duration from avio_size()/stride arithmetic -
+     * the sidecar, maintained by the writer, is the sole source of truth;
+     * see mxf_growing_available_edit_units(). */
+    if (mxf->growing_role == MXF_GROWING_ROLE_READER)
+        return AV_NOPTS_VALUE;
+
+    if (mxf->growing_stride <= 0 || mxf->growing_elem_size <= 0)
+        return AV_NOPTS_VALUE;
+
+    fs = avio_size(s->pb);
+    if (fs <= 0)
+        return AV_NOPTS_VALUE;
+
+    /* once the footer and RIP have landed, raw file size over-counts */
+    if (mxf->growing_footer_offset > 0)
+        fs = FFMIN(fs, mxf->run_in + mxf->growing_footer_offset);
+
+    avail = fs - mxf->growing_essence_offset;
+    if (avail < mxf->growing_elem_size)
+        return 0;
+    return (avail - mxf->growing_elem_size) / mxf->growing_stride + 1;
+}
+
+/**
+ * How many reference-track edit units can be reached right now, taking the
+ * best of the CBR geometry and the sidecar index (the latter is the only
+ * source for VBR).
+ */
+static int64_t mxf_growing_available_edit_units(AVFormatContext *s)
+{
+    MXFContext *mxf = s->priv_data;
+    int64_t dur, idx = AV_NOPTS_VALUE;
+
+    if (mxf->growing_role == MXF_GROWING_ROLE_READER) {
+        /* the reader never re-derives duration itself: reload whatever the
+         * writer has published in the sidecar (both the dense entries and
+         * the O(1) duration field, which is what a clip-wrapped/header-only
+         * sidecar has instead of entries) and trust that alone. */
+        mxf_growing_reload_sidecar(s);
+        if (mxf->growing_vbr_index && mxf->growing_vbr_index->nb_entries > 0)
+            idx = mxf->growing_vbr_index->nb_entries;
+        if (mxf->growing_sidecar_duration > 0)
+            idx = idx == AV_NOPTS_VALUE ? mxf->growing_sidecar_duration
+                                        : FFMAX(idx, mxf->growing_sidecar_duration);
+        return idx;
+    }
+
+    dur = mxf_growing_compute_duration(s);
+    if (mxf->growing_vbr_index) {
+        mxf_growing_reload_sidecar(s);
+        if (mxf->growing_vbr_index->nb_entries > 0)
+            idx = mxf->growing_vbr_index->nb_entries;
+    }
+    if (dur == AV_NOPTS_VALUE) {
+        /* idx stands as computed above */
+    } else if (idx == AV_NOPTS_VALUE) {
+        idx = dur;
+    } else {
+        idx = FFMAX(dur, idx);
+    }
+
+    /* HEVC and any other long-GOP codec get no bitstream-derived reorder
+     * (see mxf_growing_index_ref_klv()/mxf_growing_set_reordered_pts()), so
+     * the writer must not deliver past the last edit unit a real,
+     * already-published container IndexTableSegment covers - that is the
+     * only source mxf_set_pts() can correctly reorder from for such a track.
+     * Costs up to one GOP of latency, always correct. Intra-only, MPEG-2 and
+     * H.264 reference tracks are unaffected: they have their own reorder
+     * source or nothing to reorder. */
+    if (idx != AV_NOPTS_VALUE && mxf->growing_ref_stream >= 0 &&
+        mxf->growing_ref_stream < s->nb_streams) {
+        MXFTrack *ref_track = s->streams[mxf->growing_ref_stream]->priv_data;
+        enum AVCodecID cid  = s->streams[mxf->growing_ref_stream]->codecpar->codec_id;
+
+        if (!(ref_track && ref_track->intra_only) &&
+            cid != AV_CODEC_ID_MPEG2VIDEO && cid != AV_CODEC_ID_H264) {
+            MXFIndexTable *t = ref_track ? mxf_find_index_table(mxf, ref_track->index_sid) : NULL;
+
+            idx = (t && t->nb_ptses > 0) ? FFMIN(idx, t->nb_ptses) : 0;
+        }
+    }
+
+    return idx;
+}
+
+/**
+ * Re-publish the live duration everywhere it is cached. Both
+ * mxf_compute_index_tables() and mxf_compute_essence_containers() latch a
+ * duration at open time, and mxf_edit_unit_absolute_offset() /
+ * mxf_absolute_bodysid_offset() clamp against those latched values - so
+ * without this a seek past the open-time duration fails even when the essence
+ * is present.
+ */
+static void mxf_growing_refresh_duration(AVFormatContext *s)
+{
+    MXFContext *mxf = s->priv_data;
+    MXFTrack *ref = mxf_growing_ref_track(s);
+    int64_t dur = mxf_growing_available_edit_units(s);
+    int64_t fs;
+
+    if (!ref || !ref->edit_rate.num || dur == AV_NOPTS_VALUE || dur <= 0)
+        return;
+    if (dur == mxf->growing_cur_duration)
+        return;
+    mxf->growing_cur_duration = dur;
+
+    /* (1) per-track duration, rescaled out of reference edit units */
+    for (int i = 0; i < s->nb_streams; i++) {
+        AVStream *st = s->streams[i];
+        MXFTrack *tr = st->priv_data;
+
+        if (!tr || !tr->edit_rate.num)
+            continue;
+        tr->original_duration = av_rescale_q(dur, av_inv_q(ref->edit_rate),
+                                             av_inv_q(tr->edit_rate));
+        st->duration = av_rescale_q(dur, av_inv_q(ref->edit_rate), st->time_base);
+    }
+
+    /* (2) unfreeze mxf_edit_unit_absolute_offset()'s clamp. Only for a single
+     *     CBR segment: a VBR segment's index_duration must keep matching
+     *     nb_index_entries or mxf_compute_ptses_fake_index() breaks. */
+    for (int j = 0; j < mxf->nb_index_tables; j++) {
+        MXFIndexTable *t = &mxf->index_tables[j];
+
+        if (t->nb_segments != 1 || !t->segments[0]->edit_unit_byte_count)
+            continue;
+        if (!t->segments[0]->index_edit_rate.num)
+            continue;
+        t->segments[0]->index_duration =
+            av_rescale_q(dur, av_inv_q(ref->edit_rate),
+                         av_inv_q(t->segments[0]->index_edit_rate));
+    }
+
+    /* (3) unfreeze mxf_absolute_bodysid_offset()'s bound. Never for
+     *     clip-wrapped essence, whose KLV length is fixed. */
+    fs = avio_size(s->pb);
+    if (fs > 0 && mxf->partitions_count > 0) {
+        MXFPartition *p = &mxf->partitions[mxf->partitions_count - 1];
+
+        if (mxf->growing_footer_offset > 0)
+            fs = FFMIN(fs, mxf->run_in + mxf->growing_footer_offset);
+        if (p->body_sid && p->essence_offset > 0 && fs > p->essence_offset &&
+            mxf_get_wrapping_by_body_sid(s, p->body_sid) != ClipWrapped)
+            p->essence_length = fs - p->essence_offset;
+    }
+
+    /* (4) publish it in the sidecar header. A clip-wrapped reference track gets
+     *     no entries at all - one KLV covers the whole essence, and for PCM the
+     *     edit unit is a single sample, so per-edit-unit entries would run to
+     *     gigabytes while carrying nothing the header does not already have. */
+    mxf_growing_patch_sidecar_duration(s, dur);
+}
+
+/**
+ * Look for evidence that the writer finalized the file. Position-safe on every
+ * path. Never transitions - see the comment in mxf_read_packet().
+ *
+ * @return 1 if a footer partition was found and verified, 0 if not,
+ *         AVERROR(EIO) if the AVIO position could not be restored.
+ */
+static int mxf_growing_probe_footer(AVFormatContext *s)
+{
+    MXFContext *mxf = s->priv_data;
+    int64_t saved = avio_tell(s->pb);
+    uint64_t saved_fp = mxf->footer_partition;
+    uint64_t cand = 0;
+    int64_t fs;
+    int ret = 0;
+
+    if (mxf->growing_file_closed)
+        return 1;
+    if (!(s->pb->seekable & AVIO_SEEKABLE_NORMAL))
+        return 0;
+    fs = avio_size(s->pb);
+    if (fs <= 0)
+        return 0;
+
+    /* Signal 1: the RandomIndexPack at EOF. Self-validating - it matches the
+     * full 16-byte RIP key and requires klv.next_klv == file_size - so it
+     * cannot false-positive on essence bytes. mxf_write_footer() emits it
+     * before it patches the header, so it appears first. */
+    mxf_read_random_index_pack(s);
+    if (mxf->footer_partition)
+        cand = mxf->footer_partition;
+
+    /* Signal 2: the header partition pack's FooterPartition field, at value
+     * offset 24. Only present if the writer could seek back and patch it. */
+    if (!cand && mxf->partitions_count > 0 &&
+        mxf->partitions[0].pack_value_ofs > 0) {
+        if (avio_seek(s->pb, mxf->partitions[0].pack_value_ofs + 24, SEEK_SET) >= 0) {
+            uint64_t v = avio_rb64(s->pb);
+            if (!avio_feof(s->pb) && v && mxf->run_in + (int64_t)v < fs)
+                cand = v;
+        }
+    }
+
+    /* Verify a Footer partition pack really is there. This is what turns two
+     * heuristics into one deterministic signal, and it also catches a
+     * half-rewritten header partition pack. */
+    if (cand) {
+        uint8_t key[16];
+
+        if (avio_seek(s->pb, mxf->run_in + (int64_t)cand, SEEK_SET) >= 0 &&
+            avio_read(s->pb, key, sizeof(key)) == sizeof(key) &&
+            mxf_is_partition_pack_key(key) && key[13] == 4) {
+            mxf->footer_partition      = cand;
+            mxf->growing_footer_offset = cand;
+            mxf->growing_file_closed   = 1;
+            ret = 1;
+            av_log(s, AV_LOG_INFO, "growing MXF: footer partition detected at "
+                   "0x%"PRIx64"\n", mxf->run_in + (int64_t)cand);
+        } else {
+            /* do not leave an unverified value behind - mxf_read_partition_pack()
+             * never clears a learned footer_partition */
+            mxf->footer_partition = saved_fp;
+        }
+    }
+
+    if (avio_seek(s->pb, saved, SEEK_SET) < 0)
+        return AVERROR(EIO);
+    return ret;
+}
+
+/**
+ * True when the writer has not written as far as `end` yet.
+ *
+ * A growing file routinely ends in the middle of an edit unit, and
+ * klv_read_packet() only needs the key and the BER length - both of which land
+ * before the payload. Returning such a packet yields a short frame ("frame size
+ * does not match index unit size"), so the read has to wait instead.
+ *
+ * `end` must be the end of the packet actually about to be returned: for
+ * clip-wrapped essence that is the computed edit-unit sub-range, NOT
+ * klv.next_klv, which is the end of the one KLV covering the whole essence and
+ * therefore always lies beyond a growing file.
+ *
+ * The cached size keeps this off the fstat() path for every packet.
+ */
+static int mxf_growing_incomplete(AVFormatContext *s, int64_t end)
+{
+    MXFContext *mxf = s->priv_data;
+    int64_t fs;
+
+    if (end <= mxf->growing_last_size)
+        return 0;
+    fs = avio_size(s->pb);
+    if (fs > 0)
+        mxf->growing_last_size = fs;
+    return end > mxf->growing_last_size;
+}
+
+/**
+ * One iteration of the growing-mode wait, shared by mxf_read_packet()'s
+ * end-of-data wait and mxf_read_seek()'s blocking wait.
+ *
+ * INVARIANT: on every return path the AVIO position is what it was on entry
+ * and pb->eof_reached is clear (the restoring avio_seek() clears it
+ * unconditionally). Callers may therefore retry a read at their own cursor
+ * with no bookkeeping of their own.
+ */
+static int mxf_growing_wait_step(AVFormatContext *s)
+{
+    MXFContext *mxf = s->priv_data;
+    int64_t saved = avio_tell(s->pb);
+    int64_t now, size, slept;
+    int res = MXF_WAIT_RETRY;
+
+    /* sticky states first: no sleep, no I/O */
+    if (mxf->growing_timed_out)
+        return MXF_WAIT_TIMEOUT;
+    if (mxf->growing_file_closed)
+        return MXF_WAIT_FINALIZED;
+    if (ff_check_interrupt(&s->interrupt_callback))
+        return MXF_WAIT_INTERRUPT;
+
+    /* the stall timeout is checked before sleeping so it cannot overshoot by a
+     * whole poll interval */
+    now = av_gettime_relative();
+    if (mxf->growing_timeout_us > 0 &&
+        now - mxf->growing_last_progress_us >= mxf->growing_timeout_us) {
+        av_log(s, AV_LOG_INFO, "growing MXF: no new data for %"PRId64" us, "
+               "returning EOF\n", now - mxf->growing_last_progress_us);
+        mxf->growing_timed_out = 1;
+        av_dict_set(&s->metadata, "growing_timed_out", "1", 0);
+        return MXF_WAIT_TIMEOUT;
+    }
+
+    /* sliced so a large growing_poll_us does not cost that much SIGINT latency */
+    for (slept = 0; slept < mxf->growing_poll_us;
+         slept += MXF_GROWING_SLEEP_SLICE_US) {
+        av_usleep(FFMIN(MXF_GROWING_SLEEP_SLICE_US,
+                        mxf->growing_poll_us - slept));
+        if (ff_check_interrupt(&s->interrupt_callback))
+            return MXF_WAIT_INTERRUPT;
+    }
+
+    /* any growth at all, even a partial edit unit, means the writer is alive */
+    size = avio_size(s->pb);
+    if (size > 0 && size > mxf->growing_last_size) {
+        mxf->growing_last_size = size;
+        mxf_growing_note_progress(mxf);
+    }
+
+    /* probe on a time base, not every Nth poll: growing_poll_us can be 1 ms */
+    now = av_gettime_relative();
+    if (now - mxf->growing_last_probe_us >= MXF_GROWING_FOOTER_PROBE_US) {
+        mxf->growing_last_probe_us = now;
+        if (mxf_growing_probe_footer(s) > 0)
+            res = MXF_WAIT_FINALIZED;
+    }
+
+    if (avio_seek(s->pb, saved, SEEK_SET) < 0) {
+        av_log(s, AV_LOG_ERROR, "growing MXF: cannot re-seek to %"PRId64"; the "
+               "input does not support range requests\n", saved);
+        return MXF_WAIT_ERROR;
+    }
+    return res;
+}
+
+/**
+ * Rewind to `retry_pos` and wait for the file to grow.
+ *
+ * @return 1 to retry the read, 0 if the file finalized and the data will never
+ *         arrive, or a negative AVERROR.
+ */
+static int mxf_growing_wait_for_data(AVFormatContext *s, int64_t retry_pos)
+{
+    MXFContext *mxf = s->priv_data;
+
+    if (avio_seek(s->pb, retry_pos, SEEK_SET) < 0)
+        return AVERROR(EIO);
+
+    switch (mxf->growing_role == MXF_GROWING_ROLE_READER
+            ? mxf_growing_reader_wait_step(s)
+            : mxf_growing_wait_step(s)) {
+    case MXF_WAIT_RETRY:
+    case MXF_WAIT_ROLE_CHANGED: return 1;
+    case MXF_WAIT_FINALIZED:    return 0;
+    case MXF_WAIT_TIMEOUT:      return AVERROR_EOF;
+    case MXF_WAIT_INTERRUPT:    return AVERROR_EXIT;
+    default:                     return AVERROR(EIO);
+    }
+}
+
+/* --- sidecar index ------------------------------------------------------- */
+
+static void mxf_growing_release_sidecar_write(MXFContext *mxf)
+{
+    if (mxf->growing_index_out) {
+        fclose(mxf->growing_index_out);
+        mxf->growing_index_out = NULL;
+    }
+}
+
+/**
+ * Take an advisory write lock so a second process cannot interleave entries.
+ * A failure is not fatal: the caller falls back to using the sidecar read-only.
+ */
+static int mxf_growing_sidecar_lock(AVFormatContext *s, FILE *f)
+{
+#if HAVE_FCNTL && HAVE_UNISTD_H
+    struct flock fl;
+
+    memset(&fl, 0, sizeof(fl));
+    fl.l_type   = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start  = 0;
+    fl.l_len    = 0;
+    if (fcntl(fileno(f), F_SETLK, &fl) < 0)
+        return AVERROR(errno);
+#else
+    av_log(s, AV_LOG_VERBOSE, "growing MXF: no fcntl(); the sidecar "
+           "single-writer constraint is not enforced on this platform\n");
+#endif
+    return 0;
+}
+
+/**
+ * A file that already has a footer at open builds no sidecar of its own (the
+ * closed file's own container index already gives O(1) duration for free),
+ * but a stale sidecar left behind by an earlier growing session of this same
+ * output path must not linger and mislead a future reader into thinking the
+ * file is still growing.
+ *
+ * Best-effort: try the write lock, delete the file if acquired, leave it
+ * alone (logging only) if refused - deletion order between two processes
+ * racing for the same stale file is inherently nondeterministic and is not
+ * this function's problem to solve.
+ */
+static void mxf_growing_cleanup_stale_sidecar(AVFormatContext *s)
+{
+    MXFContext *mxf = s->priv_data;
+    FILE *f;
+
+    f = avpriv_fopen_utf8(mxf->growing_index_file, "r+b");
+    if (!f)
+        return;                             /* nothing to clean up */
+
+    if (mxf_growing_sidecar_lock(s, f) < 0) {
+        av_log(s, AV_LOG_VERBOSE, "growing MXF: a stale-looking sidecar %s is "
+               "locked by another process; leaving it for that process to "
+               "clean up\n", mxf->growing_index_file);
+        fclose(f);
+        return;
+    }
+    fclose(f);   /* releases the lock - see the note on POSIX record locks */
+
+    if (remove(mxf->growing_index_file) < 0)
+        av_log(s, AV_LOG_WARNING, "growing MXF: could not remove stale "
+               "sidecar %s: %s\n", mxf->growing_index_file,
+               av_err2str(AVERROR(errno)));
+    else
+        av_log(s, AV_LOG_DEBUG, "growing MXF: removed stale sidecar %s\n",
+               mxf->growing_index_file);
+}
+
+/**
+ * Rewrite the header fields that are only known once the stride has been
+ * measured. Possible because the handle is "r+b" and not append mode.
+ */
+static void mxf_growing_patch_sidecar_header(AVFormatContext *s)
+{
+    MXFContext *mxf = s->priv_data;
+    uint8_t buf[12];
+
+    if (!mxf->growing_index_out)
+        return;
+
+    AV_WB64(buf + 0, mxf->growing_essence_offset);
+    AV_WB32(buf + 8, mxf->growing_stride > 0 ? (uint32_t)mxf->growing_stride : 0);
+    if (fseeko(mxf->growing_index_out, 16, SEEK_SET) == 0 &&
+        fwrite(buf, 1, sizeof(buf), mxf->growing_index_out) == sizeof(buf))
+        fflush(mxf->growing_index_out);
+}
+
+/**
+ * Keep the header's duration field current. This is what a consumer reads for
+ * an O(1) duration; the entry count only reflects what has been indexed.
+ */
+static void mxf_growing_patch_sidecar_duration(AVFormatContext *s, int64_t dur)
+{
+    MXFContext *mxf = s->priv_data;
+    uint8_t buf[8];
+
+    if (!mxf->growing_index_out || dur < 0)
+        return;
+    AV_WB64(buf, dur);
+    if (fseeko(mxf->growing_index_out, 36, SEEK_SET) == 0 &&
+        fwrite(buf, 1, sizeof(buf), mxf->growing_index_out) == sizeof(buf))
+        fflush(mxf->growing_index_out);
+}
+
+/**
+ * Open the sidecar for writing and take the write lock.
+ *
+ * MUST run after mxf_growing_open_sidecar_read() has closed its own handle: a
+ * POSIX record lock is released when the process closes ANY descriptor to the
+ * file.
+ */
+static int mxf_growing_open_sidecar_write(AVFormatContext *s, int start_fresh)
+{
+    MXFContext *mxf = s->priv_data;
+    MXFTrack *ref = mxf_growing_ref_track(s);
+    AVRational edit_rate = { 0, 1 };
+    uint8_t hdr[MXF_GIDX_HEADER_SIZE];
+    FILE *f;
+    int64_t size;
+    int ret;
+
+    if (start_fresh) {
+        f = avpriv_fopen_utf8(mxf->growing_index_file, "w+b");
+    } else {
+        f = avpriv_fopen_utf8(mxf->growing_index_file, "r+b");
+        if (!f)
+            f = avpriv_fopen_utf8(mxf->growing_index_file, "w+b");
+    }
+    if (!f) {
+        av_log(s, AV_LOG_ERROR, "growing MXF: cannot open sidecar %s: %s\n",
+               mxf->growing_index_file, av_err2str(AVERROR(errno)));
+        return AVERROR(errno);
+    }
+
+    ret = mxf_growing_sidecar_lock(s, f);
+    if (ret < 0) {
+        av_log(s, AV_LOG_WARNING, "growing MXF: another process holds the "
+               "sidecar write lock on %s (%s); using it read-only\n",
+               mxf->growing_index_file, av_err2str(ret));
+        fclose(f);
+        return 0;
+    }
+
+    if (fseeko(f, 0, SEEK_END) < 0) {
+        fclose(f);
+        return AVERROR(EIO);
+    }
+    size = ftello(f);
+
+    if (size == 0) {
+        memset(hdr, 0, sizeof(hdr));
+        memcpy(hdr, "MXFGIDX\x01", 8);
+        hdr[8]  = 1;                    /* version */
+        /* byte 9 is unused space between version and flags: this format has
+         * no "complete" byte. Completion is signaled solely by the sidecar
+         * file's deletion - see mxf_growing_transition_to_closed(). */
+        hdr[10] = MXF_GIDX_FLAG_DENSE;  /* one entry per reference edit unit */
+        if (ref)
+            edit_rate = ref->edit_rate;
+        AV_WB64(hdr + 16, mxf->growing_essence_offset);
+        /* bytes per edit unit of the reference track, INCLUDING KLV overhead;
+         * 0 means "not constant" (VBR) or "not yet measured" */
+        AV_WB32(hdr + 24, mxf->growing_stride > 0 ? (uint32_t)mxf->growing_stride : 0);
+        AV_WB32(hdr + 28, edit_rate.num);
+        AV_WB32(hdr + 32, edit_rate.den);
+        /* current duration in reference-track edit units, 0 = unknown. Kept up
+         * to date by mxf_growing_patch_sidecar_duration(). This is the O(1)
+         * duration a consumer should read: the entry count only tracks what has
+         * been indexed, and clip-wrapped essence has no entries at all. */
+        AV_WB64(hdr + 36, 0);
+        if (fwrite(hdr, 1, sizeof(hdr), f) != sizeof(hdr) || fflush(f)) {
+            av_log(s, AV_LOG_ERROR, "growing MXF: cannot write the sidecar "
+                   "header to %s\n", mxf->growing_index_file);
+            fclose(f);
+            return AVERROR(EIO);
+        }
+        mxf->growing_index_entries_written = 0;
+    } else if (size >= MXF_GIDX_HEADER_SIZE) {
+        mxf->growing_index_entries_written =
+            (size - MXF_GIDX_HEADER_SIZE) / MXF_GIDX_ENTRY_SIZE;
+    } else {
+        av_log(s, AV_LOG_ERROR, "growing MXF: sidecar %s is truncated "
+               "(%"PRId64" bytes)\n", mxf->growing_index_file, size);
+        fclose(f);
+        return AVERROR_INVALIDDATA;
+    }
+
+    mxf->growing_index_out = f;
+    av_log(s, AV_LOG_DEBUG, "growing MXF: sidecar %s open for writing, "
+           "%"PRId64" existing entries\n", mxf->growing_index_file,
+           mxf->growing_index_entries_written);
+    return 0;
+}
+
+/**
+ * Append one 16-byte entry. A torn or failed write disables the index rather
+ * than leaving every later entry misaligned.
+ */
+static void mxf_growing_write_index_entry(AVFormatContext *s, int64_t offset,
+                                          int32_t size, int8_t temporal_offset,
+                                          uint8_t flags)
+{
+    MXFContext *mxf = s->priv_data;
+    uint8_t e[MXF_GIDX_ENTRY_SIZE];
+
+    if (!mxf->growing_index_out)
+        return;
+
+    AV_WB64(e + 0, offset);
+    AV_WB32(e + 8, size);
+    e[12] = (uint8_t)temporal_offset;
+    e[13] = flags;
+    e[14] = 0;
+    e[15] = 0;
+
+    /* the handle is "r+b", so the append position must be set explicitly.
+     * fflush() per entry keeps a stat()-polling reader within one edit unit of
+     * reality, which is the whole point of the sidecar. */
+    if (fseeko(mxf->growing_index_out, 0, SEEK_END) < 0 ||
+        fwrite(e, 1, sizeof(e), mxf->growing_index_out) != sizeof(e) ||
+        fflush(mxf->growing_index_out)) {
+        av_log(s, AV_LOG_ERROR, "growing MXF: sidecar write failed; disabling "
+               "the index\n");
+#if HAVE_UNISTD_H
+        if (ftruncate(fileno(mxf->growing_index_out),
+                      MXF_GIDX_HEADER_SIZE +
+                      mxf->growing_index_entries_written * MXF_GIDX_ENTRY_SIZE) < 0)
+            av_log(s, AV_LOG_WARNING, "growing MXF: could not truncate the torn "
+                   "sidecar tail\n");
+#endif
+        mxf_growing_release_sidecar_write(mxf);
+        mxf->growing_index_disabled = 1;
+        return;
+    }
+    mxf->growing_index_entries_written++;
+}
+
+/**
+ * Append one entry to the in-memory index, growing the arrays as needed.
+ */
+static int mxf_growing_vbr_append(MXFContext *mxf, int64_t offset, int32_t size,
+                                  int8_t temporal_offset, uint8_t flags)
+{
+    MXFGrowingIndex *gi = mxf->growing_vbr_index;
+    void *tmp;
+
+    if (!gi)
+        return 0;
+    if (gi->nb_entries >= gi->entries_alloc) {
+        int64_t new_alloc = FFMAX(gi->entries_alloc * 2, 1024);
+
+        tmp = av_realloc_array(gi->offsets, new_alloc, sizeof(*gi->offsets));
+        if (!tmp)
+            return AVERROR(ENOMEM);
+        gi->offsets = tmp;
+        tmp = av_realloc_array(gi->sizes, new_alloc, sizeof(*gi->sizes));
+        if (!tmp)
+            return AVERROR(ENOMEM);
+        gi->sizes = tmp;
+        tmp = av_realloc_array(gi->temporal_offsets, new_alloc,
+                               sizeof(*gi->temporal_offsets));
+        if (!tmp)
+            return AVERROR(ENOMEM);
+        gi->temporal_offsets = tmp;
+        tmp = av_realloc_array(gi->flags, new_alloc, sizeof(*gi->flags));
+        if (!tmp)
+            return AVERROR(ENOMEM);
+        gi->flags = tmp;
+        gi->entries_alloc = new_alloc;
+    }
+    gi->offsets[gi->nb_entries]          = offset;
+    gi->sizes[gi->nb_entries]            = size;
+    gi->temporal_offsets[gi->nb_entries] = temporal_offset;
+    gi->flags[gi->nb_entries]            = flags;
+    gi->nb_entries++;
+    return 0;
+}
+
+static void mxf_growing_free_index(MXFContext *mxf)
+{
+    if (!mxf->growing_vbr_index)
+        return;
+    av_freep(&mxf->growing_vbr_index->offsets);
+    av_freep(&mxf->growing_vbr_index->sizes);
+    av_freep(&mxf->growing_vbr_index->temporal_offsets);
+    av_freep(&mxf->growing_vbr_index->flags);
+    av_freep(&mxf->growing_vbr_index);
+}
+
+/**
+ * Load an existing sidecar into mxf->growing_vbr_index so this reader can
+ * resume it rather than duplicating it.
+ *
+ * @return 0 if the sidecar is usable (possibly with zero entries),
+ *         < 0 if it is absent, stale or incompatible - in which case the
+ *         caller must start a fresh one.
+ */
+static int mxf_growing_open_sidecar_read(AVFormatContext *s)
+{
+    MXFContext *mxf = s->priv_data;
+    MXFTrack *ref = mxf_growing_ref_track(s);
+    uint8_t hdr[MXF_GIDX_HEADER_SIZE];
+    MXFGrowingIndex *gi;
+    FILE *f;
+    int64_t size, nb_entries, i;
+    int ret;
+
+    f = avpriv_fopen_utf8(mxf->growing_index_file, "rb");
+    if (!f) {
+        /* ENOENT: nothing exists yet, so "start fresh" cannot lose anything -
+         * treat it the same as an invalid/unresumable sidecar. Anything else
+         * (EACCES, EMFILE, ...) is transient and must not be mistaken for
+         * grounds to recreate (and thereby truncate) a real, existing file. */
+        return errno == ENOENT ? AVERROR_INVALIDDATA : AVERROR(errno);
+    }
+
+    if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
+        fclose(f);
+        return AVERROR_INVALIDDATA;         /* empty or truncated: start fresh */
+    }
+    if (memcmp(hdr, "MXFGIDX\x01", 8) || hdr[8] != 1) {
+        av_log(s, AV_LOG_WARNING, "growing MXF: sidecar %s has a bad magic or "
+               "version; re-indexing\n", mxf->growing_index_file);
+        fclose(f);
+        return AVERROR_INVALIDDATA;
+    }
+    if (!(hdr[10] & MXF_GIDX_FLAG_DENSE)) {
+        av_log(s, AV_LOG_WARNING, "growing MXF: sidecar %s is not edit-unit "
+               "dense (written by an older build); re-indexing\n",
+               mxf->growing_index_file);
+        fclose(f);
+        return AVERROR_INVALIDDATA;
+    }
+    if (ref && ref->edit_rate.num &&
+        (AV_RB32(hdr + 28) != (uint32_t)ref->edit_rate.num ||
+         AV_RB32(hdr + 32) != (uint32_t)ref->edit_rate.den)) {
+        av_log(s, AV_LOG_WARNING, "growing MXF: sidecar %s was written for a "
+               "different edit rate; re-indexing\n", mxf->growing_index_file);
+        fclose(f);
+        return AVERROR_INVALIDDATA;
+    }
+
+    /* a reader never measures these itself (mxf_growing_measure_stride()/
+     * mxf_growing_observe_klv() are writer-only) - load them from the
+     * incumbent writer's header so a later takeover with an empty in-memory
+     * index (mxf_growing_attempt_takeover()) has a real fallback instead of
+     * the zero-initialized default. */
+    mxf->growing_essence_offset = AV_RB64(hdr + 16);
+    mxf->growing_stride         = (int64_t)AV_RB32(hdr + 24);
+
+    if (fseeko(f, 0, SEEK_END) < 0) {
+        fclose(f);
+        return AVERROR(EIO);
+    }
+    size = ftello(f);
+    nb_entries = (size - MXF_GIDX_HEADER_SIZE) / MXF_GIDX_ENTRY_SIZE;
+    if (nb_entries < 0)
+        nb_entries = 0;
+
+    gi = av_mallocz(sizeof(*gi));
+    if (!gi) {
+        fclose(f);
+        return AVERROR(ENOMEM);
+    }
+
+    if (fseeko(f, MXF_GIDX_HEADER_SIZE, SEEK_SET) < 0) {
+        av_freep(&gi);
+        fclose(f);
+        return AVERROR(EIO);
+    }
+
+    /* hand gi to the context up front so mxf_growing_vbr_append() can grow it */
+    mxf_growing_free_index(mxf);
+    mxf->growing_vbr_index = gi;
+
+    for (i = 0; i < nb_entries; i++) {
+        uint8_t e[MXF_GIDX_ENTRY_SIZE];
+
+        if (fread(e, 1, sizeof(e), f) != sizeof(e))
+            break;
+        ret = mxf_growing_vbr_append(mxf, AV_RB64(e + 0), AV_RB32(e + 8),
+                                     (int8_t)e[12], e[13]);
+        if (ret < 0) {
+            fclose(f);
+            return ret;
+        }
+    }
+
+    fclose(f);
+    av_log(s, AV_LOG_DEBUG, "growing MXF: loaded %"PRId64" sidecar entries from "
+           "%s\n", gi->nb_entries, mxf->growing_index_file);
+    return 0;
+}
+
+/**
+ * Pick up entries (and the published duration) another process has appended
+ * since the last look.
+ *
+ * Deliberately a no-op when we hold the write lock: re-opening the path would
+ * release this process's fcntl() record lock on the first close, and our own
+ * in-memory index is authoritative anyway.
+ *
+ * @return 1 if the sidecar advanced (new entries and/or a larger published
+ *         duration) - this IS the reader's index-stall progress signal,
+ *         0 if it exists but did not advance,
+ *         AVERROR(ENOENT) if the sidecar is gone (completion, or a stale
+ *         index removed out from under us - the caller must tell those apart
+ *         with mxf_growing_probe_footer()),
+ *         another negative AVERROR on I/O failure.
+ */
+static int mxf_growing_reload_sidecar(AVFormatContext *s)
+{
+    MXFContext *mxf = s->priv_data;
+    MXFGrowingIndex *gi = mxf->growing_vbr_index;
+    FILE *f;
+    uint8_t durbuf[8];
+    int64_t size, nb_on_disk, i, new_duration;
+    int advanced = 0;
+
+    if (mxf->growing_index_out)
+        return 0;
+    if (!mxf->growing_index_file || !gi)
+        return 0;
+
+    f = avpriv_fopen_utf8(mxf->growing_index_file, "rb");
+    if (!f)
+        return AVERROR(errno);
+
+    if (fseeko(f, 0, SEEK_END) < 0) {
+        fclose(f);
+        return AVERROR(EIO);
+    }
+    size = ftello(f);
+    if (size < MXF_GIDX_HEADER_SIZE) {
+        fclose(f);
+        return 0;                          /* still being created */
+    }
+
+    if (fseeko(f, 36, SEEK_SET) == 0 &&
+        fread(durbuf, 1, sizeof(durbuf), f) == sizeof(durbuf)) {
+        new_duration = (int64_t)AV_RB64(durbuf);
+        if (new_duration > mxf->growing_sidecar_duration) {
+            mxf->growing_sidecar_duration = new_duration;
+            advanced = 1;
+        }
+    }
+
+    nb_on_disk = (size - MXF_GIDX_HEADER_SIZE) / MXF_GIDX_ENTRY_SIZE;
+    if (nb_on_disk > gi->nb_entries) {
+        if (fseeko(f, MXF_GIDX_HEADER_SIZE + gi->nb_entries * MXF_GIDX_ENTRY_SIZE,
+                   SEEK_SET) == 0) {
+            for (i = gi->nb_entries; i < nb_on_disk; i++) {
+                uint8_t e[MXF_GIDX_ENTRY_SIZE];
+
+                if (fread(e, 1, sizeof(e), f) != sizeof(e))
+                    break;
+                if (mxf_growing_vbr_append(mxf, AV_RB64(e + 0), AV_RB32(e + 8),
+                                           (int8_t)e[12], e[13]) < 0)
+                    break;
+            }
+        }
+        advanced = 1;
+    }
+    fclose(f);
+    return advanced;
+}
+
+/**
+ * Index one essence element of the reference track.
+ *
+ * Entry i must be edit unit i, so appending is only legal at the end of what
+ * is already indexed. Rather than a byte high-water mark (which silently
+ * permits a gap when the read starts mid-file), we recognise the last indexed
+ * KLV by its recorded offset and resume from the one after it.
+ */
+#define MXF_GROWING_MPEG2_SCAN 256    /* group/picture header always lands well within this */
+#define MXF_GROWING_H264_SCAN  16384  /* SPS/PPS/SEI + start of first slice NAL */
+
+/**
+ * MPEG-2: temporal_reference (10 bits) and picture_coding_type (3 bits) sit
+ * immediately after picture_start_code (0x00000100) in the picture header;
+ * group_start_code (0x000001B8) marks a new GOP. Scans the bytes already
+ * about to be walked for this KLV: mxf_read_packet() has, at the call site,
+ * only read the KLV key + BER length, so the AVIO position is exactly this
+ * element's payload start - read a small prefix and seek back, leaving the
+ * demux cursor exactly where mxf_read_packet() left it.
+ *
+ * temporal_offset is defined relative to file/storage position (the edit
+ * unit that actually holds this picture's data), i.e.
+ * temporal_offset = temporal_reference - (edit_unit - gop_start_edit_unit):
+ * this is the OPPOSITE axis from the closed file's own IndexTableSegment
+ * TemporalOffset field (indexed by display position) - see
+ * mxf_growing_set_reordered_pts() for why that matters for first_dts.
+ *
+ * @return 1 if a picture header was found (temporal_offset/is_key filled),
+ *         0 otherwise (both left untouched; edit unit gets temporal_offset 0).
+ */
+static int mxf_growing_index_mpeg2_temporal_offset(AVFormatContext *s,
+                                                    MXFContext *mxf,
+                                                    KLVPacket *klv,
+                                                    int64_t edit_unit,
+                                                    int8_t *temporal_offset,
+                                                    int *is_key)
+{
+    uint8_t buf[MXF_GROWING_MPEG2_SCAN];
+    int64_t start = avio_tell(s->pb);
+    int64_t want  = FFMIN((int64_t)sizeof(buf), klv->next_klv - start);
+    int n, i, found = 0;
+
+    if (want < 8)
+        return 0;
+    n = avio_read(s->pb, buf, (int)want);
+    avio_seek(s->pb, start, SEEK_SET);
+    if (n < 8)
+        return 0;
+
+    for (i = 0; i + 3 < n; i++) {
+        if (buf[i] || buf[i + 1] || buf[i + 2] != 1)
+            continue;
+        if (buf[i + 3] == 0xb8) {                    /* group_start_code */
+            mxf->growing_mpeg2_gop_start_edit_unit = edit_unit;
+            mxf->growing_mpeg2_seen_gop = 1;
+        } else if (buf[i + 3] == 0x00 && i + 6 <= n) { /* picture_start_code */
+            int temporal_reference  = (buf[i + 4] << 2) | (buf[i + 5] >> 6);
+            int picture_coding_type = (buf[i + 5] >> 3) & 0x07;
+
+            /* gop_start_edit_unit is only valid once a real group_start_code
+             * has been seen since open/takeover/restart - a fresh writer
+             * (first-time or promoted from a reader with an empty index) has
+             * no way to know where the current GOP actually started, and
+             * trusting the zero-initialized/stale default here would clip to
+             * a wrong-but-plausible temporal_offset instead of the honest
+             * "unknown" of leaving it 0. is_key is unaffected: it comes
+             * straight from picture_coding_type, not GOP position. */
+            if (mxf->growing_mpeg2_seen_gop) {
+                int64_t rel = edit_unit - mxf->growing_mpeg2_gop_start_edit_unit;
+                *temporal_offset = av_clip_int8(temporal_reference - (int)rel);
+            }
+            *is_key = (picture_coding_type == 1); /* I-picture */
+            found = 1;
+            break; /* one picture header per frame-wrapped essence element */
+        }
+    }
+    return found;
+}
+
+/**
+ * H.264: reuses the stock parser (av_parser_init(AV_CODEC_ID_H264)) as a
+ * black box - precedent for a demuxer feeding it directly outside a decode
+ * path already exists in dashenc.c/flacdec.c/demux.c. Its H264ParserContext
+ * keeps its own H264POCContext internally (MSB/LSB wraparound state for POC
+ * type 0 included) across calls on the same AVCodecParserContext, so
+ * output_picture_number/pict_type/key_frame are reliable with no hand-rolled
+ * slice-header parsing - confirmed by reading h264_parser.c: it resets that
+ * state on every IDR (H264_NAL_IDR_SLICE) and calls the same ff_h264_init_poc()
+ * the plan's hand-rolled fallback would have used.
+ *
+ * MXF's GC AVC essence mapping used in this tree is Annex-B (start-code
+ * delimited): mxfdec.c applies no h264_mp4toannexb-style conversion anywhere
+ * else for H.264 packets, unlike movdec.c's AVCC essence, so the parser is
+ * fed the KLV bytes exactly as demuxed - never touching the packets actually
+ * returned to the caller, only this private read-ahead buffer.
+ *
+ * poc_scale (encoders conventionally step POC by 2 per picture) is measured,
+ * not assumed: growing_h264.poc_scale is the running GCD of observed |POC
+ * deltas| between consecutive coded pictures in a GOP, converging after a
+ * few frames - a deliberately simpler stand-in for
+ * mxf_growing_measure_stride()'s fixed 3-sample confirmation, since GCD
+ * naturally stabilizes and a wrong transient value only affects rounding of
+ * a small offset, never seeking or delivery correctness.
+ *
+ * @return 1 if the parser produced a usable picture (temporal_offset/is_key
+ *         filled), 0 otherwise (e.g. not enough of the slice header was in
+ *         the scanned prefix).
+ */
+static int mxf_growing_index_h264_temporal_offset(AVFormatContext *s,
+                                                   MXFContext *mxf,
+                                                   KLVPacket *klv,
+                                                   AVStream *st,
+                                                   int64_t edit_unit,
+                                                   int8_t *temporal_offset,
+                                                   int *is_key)
+{
+    uint8_t buf[MXF_GROWING_H264_SCAN];
+    int64_t start = avio_tell(s->pb);
+    int64_t want  = FFMIN((int64_t)sizeof(buf), klv->next_klv - start);
+    const uint8_t *out_data;
+    int out_size, n, poc, rel, scale;
+
+    if (want <= 0)
+        return 0;
+
+    if (!mxf->growing_h264_parser) {
+        mxf->growing_h264_parser = av_parser_init(AV_CODEC_ID_H264);
+        if (!mxf->growing_h264_parser)
+            return 0;
+        mxf->growing_h264_avctx = avcodec_alloc_context3(NULL);
+        if (!mxf->growing_h264_avctx ||
+            avcodec_parameters_to_context(mxf->growing_h264_avctx, st->codecpar) < 0) {
+            av_parser_close(mxf->growing_h264_parser);
+            mxf->growing_h264_parser = NULL;
+            return 0;
+        }
+    }
+
+    n = avio_read(s->pb, buf, (int)want);
+    avio_seek(s->pb, start, SEEK_SET);
+    if (n <= 0)
+        return 0;
+
+    av_parser_parse2(mxf->growing_h264_parser, mxf->growing_h264_avctx,
+                      (uint8_t **)&out_data, &out_size, buf, n,
+                      AV_NOPTS_VALUE, AV_NOPTS_VALUE, klv->offset);
+
+    if (mxf->growing_h264_parser->key_frame) {
+        mxf->growing_h264.gop_start_edit_unit = edit_unit;
+        mxf->growing_h264.idr_poc  = mxf->growing_h264_parser->output_picture_number;
+        mxf->growing_h264.prev_poc = mxf->growing_h264.idr_poc;
+        mxf->growing_h264.seen_idr = 1;
+        *temporal_offset = 0;
+        *is_key = 1;
+        return 1;
+    }
+    if (!mxf->growing_h264.seen_idr)
+        return 0; /* no IDR observed yet (e.g. mid-GOP takeover resume): nothing to anchor to */
+
+    poc = mxf->growing_h264_parser->output_picture_number;
+    rel = poc - mxf->growing_h264.prev_poc;
+    if (rel)
+        mxf->growing_h264.poc_scale = mxf->growing_h264.poc_scale
+            ? (int)av_gcd(mxf->growing_h264.poc_scale, FFABS(rel)) : FFABS(rel);
+    mxf->growing_h264.prev_poc = poc;
+
+    scale = mxf->growing_h264.poc_scale ? mxf->growing_h264.poc_scale : 1;
+    *temporal_offset = av_clip_int8((poc - mxf->growing_h264.idr_poc) / scale -
+                                     (int)(edit_unit - mxf->growing_h264.gop_start_edit_unit));
+    *is_key = 0;
+    return 1;
+}
+
+static void mxf_growing_index_ref_klv(AVFormatContext *s, KLVPacket *klv,
+                                      AVStream *st, MXFTrack *track)
+{
+    MXFContext *mxf = s->priv_data;
+    int32_t size = (int32_t)(klv->next_klv - klv->offset);
+    int is_key = track && track->intra_only;
+    int8_t temporal_offset = 0;
+    uint8_t flags;
+    int64_t entry_offset;
+    int64_t edit_unit;
+    enum AVCodecID codec_id = st ? st->codecpar->codec_id : AV_CODEC_ID_NONE;
+
+    if (mxf->growing_role != MXF_GROWING_ROLE_WRITER)
+        return;
+    if (!mxf->growing_index_out || mxf->growing_index_disabled)
+        return;
+
+    /* OP1a: record the content package's start offset - the system item's,
+     * if one was seen since the last content package boundary, else this
+     * element's own KLV offset (e.g. OP-Atom, which has no system item) - not
+     * this element's own offset unconditionally. A growing OP1a seek must
+     * land where ordinary by-key demuxing can walk the whole package. */
+    entry_offset = (mxf->growing_cp_start_offset >= 0 &&
+                    mxf->growing_cp_start_offset <= klv->offset)
+                   ? mxf->growing_cp_start_offset : klv->offset;
+    mxf->growing_cp_start_offset = -1;  /* consumed for this content package */
+
+    if (!mxf->growing_index_armed) {
+        if (entry_offset < mxf->growing_index_resume_ofs)
+            return;                         /* still inside the indexed region */
+        if (entry_offset > mxf->growing_index_resume_ofs) {
+            av_log(s, AV_LOG_WARNING, "growing MXF: the read started at "
+                   "0x%"PRIx64" but the sidecar ends at 0x%"PRIx64"; the index "
+                   "would not be dense, so this reader will not extend it\n",
+                   entry_offset, mxf->growing_index_resume_ofs);
+            mxf_growing_release_sidecar_write(mxf);
+            mxf->growing_index_disabled = 1;
+            return;
+        }
+        mxf->growing_index_armed = 1;
+        if (mxf->growing_index_entries_written > 0) {
+            mxf->growing_index_last_ofs = entry_offset;  /* already on disk */
+            return;
+        }
+        /* an empty sidecar: resume_ofs IS entry 0, so fall through and write it */
+    }
+
+    if (entry_offset <= mxf->growing_index_last_ofs)
+        return;                             /* re-read after a backward seek */
+
+    /* MPEG-2/H.264 reference tracks: derive temporal_offset (and refine
+     * is_key) from the elementary stream itself, never the container's own
+     * IndexTableSegment - see mxf_growing_set_reordered_pts() for why. HEVC
+     * and other long-GOP codecs get no bitstream-derived reorder here;
+     * mxf_growing_available_edit_units() caps their delivery frontier at the
+     * container index instead. */
+    edit_unit = mxf->growing_index_entries_written;
+    if (codec_id == AV_CODEC_ID_MPEG2VIDEO) {
+        int mpeg2_key = 0;
+        if (mxf_growing_index_mpeg2_temporal_offset(s, mxf, klv, edit_unit,
+                                                     &temporal_offset, &mpeg2_key))
+            is_key |= mpeg2_key;
+    } else if (codec_id == AV_CODEC_ID_H264) {
+        int h264_key = 0;
+        if (mxf_growing_index_h264_temporal_offset(s, mxf, klv, st, edit_unit,
+                                                    &temporal_offset, &h264_key))
+            is_key |= h264_key;
+    }
+
+    flags = is_key ? MXF_GIDX_FLAG_KEY : 0;
+
+    mxf_growing_write_index_entry(s, entry_offset, size, temporal_offset, flags);
+    mxf_growing_vbr_append(mxf, entry_offset, size, temporal_offset, flags);
+    mxf->growing_index_last_ofs = entry_offset;
+}
+
+/**
+ * Refuse a combination the growing/sidecar machinery can never service: a
+ * clip-wrapped, audio-only reference stream with no derivable
+ * EditUnitByteCount that is not PCM. There is no way to find edit-unit
+ * boundaries in essence like that, growing or not - avformat_open_input()
+ * must fail cleanly rather than build a sidecar that can never gain an entry.
+ *
+ * Distinct from the narrower, unconditional (any wrapping/codec) check right
+ * after this one in mxf_read_header(): this one exists so the specific,
+ * definitely-unfixable combination is refused for a documented reason.
+ */
+static int mxf_growing_refuse_incompatible_essence(AVFormatContext *s)
+{
+    MXFContext *mxf = s->priv_data;
+    AVCodecParameters *par;
+    int64_t bits_per_sample;
+    int has_video = 0;
+
+    if (!mxf->growing_index_file || !mxf->growing_clip_wrapped ||
+        mxf->growing_stride > 0)
+        return 0;
+    if (mxf->growing_ref_stream < 0 || mxf->growing_ref_stream >= s->nb_streams)
+        return 0;
+
+    for (int i = 0; i < s->nb_streams; i++)
+        if (s->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+            has_video = 1;
+    if (has_video)
+        return 0;
+
+    par = s->streams[mxf->growing_ref_stream]->codecpar;
+    if (par->codec_type != AVMEDIA_TYPE_AUDIO)
+        return 0;
+
+    /* the same PCM test mxf_set_audio_pts() applies, inverted */
+    bits_per_sample = par->bits_per_coded_sample;
+    if (!bits_per_sample)
+        bits_per_sample = av_get_bits_per_sample(par->codec_id);
+    if (par->ch_layout.nb_channels > 0 && bits_per_sample > 0)
+        return 0;                          /* PCM: already works */
+
+    mxf->growing_refused = 1;
+    av_log(s, AV_LOG_ERROR, "growing MXF: refusing -growing_index_file for a "
+           "clip-wrapped, non-PCM, audio-only reference stream with no "
+           "derivable EditUnitByteCount; no edit-unit boundary can ever be "
+           "found\n");
+    return 1;
+}
+
+/**
+ * Undo whatever this process may already have done to growing_index_file
+ * before a refusal, so avformat_open_input() failing never leaves a
+ * half-created sidecar behind. A reader never created or locked anything, so
+ * it has nothing to clean up.
+ */
+static void mxf_growing_refuse_cleanup(AVFormatContext *s)
+{
+    MXFContext *mxf = s->priv_data;
+
+    if (mxf->growing_role == MXF_GROWING_ROLE_WRITER) {
+        remove(mxf->growing_index_file);
+        mxf_growing_release_sidecar_write(mxf);
+    }
+    mxf->growing_role = MXF_GROWING_ROLE_NONE;
+    mxf->growing      = 0;
+}
+
+/**
+ * Try to become the writer by locking growing_index_file (creating it if
+ * necessary, resuming it if it already exists and loads cleanly); become a
+ * reader of it otherwise. Used both for the initial role decision and to
+ * recover after the sidecar vanishes mid-run (mxf_growing_reader_wait_step()).
+ */
+static int mxf_growing_try_claim_sidecar(AVFormatContext *s)
+{
+    MXFContext *mxf = s->priv_data;
+    int read_ret, resume, ret;
+
+    read_ret = mxf_growing_open_sidecar_read(s);
+    /* Only AVERROR_INVALIDDATA means "this is not a valid/resumable sidecar" -
+     * safe grounds to recreate (and thereby truncate) the file. Anything else
+     * is a transient failure (I/O error, ENOMEM, ...); truncating a file a
+     * live writer may still be appending to on the strength of that would be
+     * destructive, so fail this open attempt cleanly instead. */
+    if (read_ret < 0 && read_ret != AVERROR_INVALIDDATA)
+        return read_ret;
+    resume = read_ret >= 0;
+    /* must run last: releases nothing of ours, and a POSIX record lock dies
+     * when this process closes any descriptor to the file - open_sidecar_read
+     * has already closed its own transient handle by the time this runs */
+    ret = mxf_growing_open_sidecar_write(s, !resume);
+    if (ret < 0)
+        return ret;
+
+    mxf->growing_role = mxf->growing_index_out ? MXF_GROWING_ROLE_WRITER
+                                                : MXF_GROWING_ROLE_READER;
+    mxf->growing_cp_start_offset = -1;
+    return 0;
+}
+
+/**
+ * Called from mxf_growing_reader_wait_step() once growing_index_stall_us has
+ * elapsed with no index progress. Never itself a give-up condition - a
+ * refusal just means the incumbent writer is still alive, and is NOT
+ * progress by any definition: it must not touch either progress timestamp.
+ *
+ * Resume point on success is the index's current frontier (the last entry's
+ * offset, or growing_essence_offset if the index is empty), never scratch.
+ * Stride/essence-offset are already in mxf-> from this reader's own header-
+ * time setup (mxf_growing_assign_role() reads them back rather than
+ * measuring, same as any reader) - they are not re-measured here either.
+ */
+static int mxf_growing_attempt_takeover(AVFormatContext *s)
+{
+    MXFContext *mxf = s->priv_data;
+    int ret = mxf_growing_try_claim_sidecar(s);
+
+    if (ret < 0)
+        return ret;
+    if (mxf->growing_role != MXF_GROWING_ROLE_WRITER) {
+        av_log(s, AV_LOG_DEBUG, "growing MXF: takeover attempt refused; "
+               "still reading\n");
+        return 0;
+    }
+
+    mxf->growing_index_resume_ofs = mxf->growing_vbr_index->nb_entries
+        ? mxf->growing_vbr_index->offsets[mxf->growing_vbr_index->nb_entries - 1]
+        : mxf->growing_essence_offset;
+    mxf->growing_index_armed       = 0;
+    mxf->growing_index_last_ofs    = INT64_MIN;
+    mxf->growing_mpeg2_seen_gop    = 0;
+    if (avio_seek(s->pb, mxf->growing_index_resume_ofs, SEEK_SET) < 0)
+        return AVERROR(EIO);
+    mxf->current_klv_data = (KLVPacket){{0}};
+    mxf->growing_last_progress_us = av_gettime_relative();
+    /* H.264 POC state cannot be reconstructed across the discontinuity - the
+     * taking-over writer restarts POC tracking from the first slice header it
+     * parses after the resume point (out of scope here; see mxf_growing_h264
+     * in MXFContext). MPEG-2's GOP-scoped state has the same problem -
+     * growing_mpeg2_seen_gop above makes it wait for a real group_start_code
+     * before trusting gop_start_edit_unit, rather than reordering off a stale
+     * or zero-initialized value from before the discontinuity. */
+    av_log(s, AV_LOG_INFO, "growing MXF: took over as writer at 0x%"PRIx64"\n",
+           mxf->growing_index_resume_ofs);
+    return 0;
+}
+
+/**
+ * The sidecar vanished (mxf_growing_reload_sidecar() returned ENOENT): either
+ * the writer finished (completion is signaled solely by deletion) or a
+ * third party removed it mid-growth. Tell those apart with a footer probe,
+ * then either revert to closed or restart as if the index never existed.
+ *
+ * "Restart" means genuinely from edit unit 0: the essence itself has not
+ * changed, only the coordination sidecar, so there is nothing to re-measure -
+ * growing_essence_offset from this reader's own header-time setup still
+ * applies.
+ *
+ * @return 0 on success (mxf->growing_role reflects the outcome),
+ *         < 0 on I/O failure re-establishing the sidecar or the AVIO position.
+ */
+static int mxf_growing_reassign_after_sidecar_loss(AVFormatContext *s)
+{
+    MXFContext *mxf = s->priv_data;
+    int ret;
+
+    ret = mxf_growing_try_claim_sidecar(s);
+    if (ret < 0)
+        return ret;
+
+    if (mxf->growing_role == MXF_GROWING_ROLE_WRITER) {
+        /* the on-disk sidecar was just recreated from scratch (0 entries) -
+         * the in-memory index must go back to entry 0 with it, or new entries
+         * append on-disk starting at 0 while continuing to append in-memory
+         * on top of the stale array. */
+        mxf_growing_free_index(mxf);
+        mxf->growing_vbr_index = av_mallocz(sizeof(*mxf->growing_vbr_index));
+        if (!mxf->growing_vbr_index)
+            return AVERROR(ENOMEM);
+        mxf->growing_index_resume_ofs = mxf->growing_essence_offset;
+        mxf->growing_index_armed      = 0;
+        mxf->growing_index_last_ofs   = INT64_MIN;
+        mxf->growing_sidecar_duration = 0;
+        mxf->growing_mpeg2_seen_gop   = 0;
+        if (avio_seek(s->pb, mxf->growing_essence_offset, SEEK_SET) < 0)
+            return AVERROR(EIO);
+        mxf->current_klv_data = (KLVPacket){{0}};
+        mxf->growing_last_progress_us = av_gettime_relative();
+        av_log(s, AV_LOG_INFO, "growing MXF: sidecar %s was removed; "
+               "restarting it from edit unit 0\n", mxf->growing_index_file);
+    } else {
+        mxf->growing_last_index_progress_us = av_gettime_relative();
+        av_log(s, AV_LOG_INFO, "growing MXF: sidecar %s was removed and "
+               "recreated by another process; resuming as a reader\n",
+               mxf->growing_index_file);
+    }
+    mxf->growing_last_takeover_try_us = av_gettime_relative();
+    return 0;
+}
+
+/**
+ * The reader's sibling to mxf_growing_wait_step(): same sticky-state/
+ * interrupt/sleep skeleton, but the progress source is sidecar advancement
+ * (growing_last_index_progress_us), not essence-stall, and a takeover attempt
+ * is layered in on its own, independent cadence (growing_index_stall_us).
+ *
+ * A reader repeatedly failing to take over an alive-but-slow writer must
+ * never time out from that alone - only growing_timeout_us against real
+ * index progress (or a directly confirmed footer) ends the wait. The stall
+ * interval only decides when a takeover is attempted, never who wins it.
+ *
+ * @return MXF_WAIT_ROLE_CHANGED if this reader just became the writer (via
+ *         takeover or post-loss reassignment) - the AVIO position now sits at
+ *         the new resume point, NOT the position this function was called
+ *         at, unlike every other return path here.
+ */
+static int mxf_growing_reader_wait_step(AVFormatContext *s)
+{
+    MXFContext *mxf = s->priv_data;
+    int64_t saved = avio_tell(s->pb);
+    int64_t now, slept;
+    int res = MXF_WAIT_RETRY;
+    int reload;
+
+    if (mxf->growing_timed_out)
+        return MXF_WAIT_TIMEOUT;
+    if (mxf->growing_file_closed)
+        return MXF_WAIT_FINALIZED;
+    if (ff_check_interrupt(&s->interrupt_callback))
+        return MXF_WAIT_INTERRUPT;
+
+    now = av_gettime_relative();
+    if (mxf->growing_timeout_us > 0 &&
+        now - mxf->growing_last_index_progress_us >= mxf->growing_timeout_us) {
+        av_log(s, AV_LOG_INFO, "growing MXF: no index progress for %"PRId64
+               " us, returning EOF\n", now - mxf->growing_last_index_progress_us);
+        mxf->growing_timed_out = 1;
+        av_dict_set(&s->metadata, "growing_timed_out", "1", 0);
+        return MXF_WAIT_TIMEOUT;
+    }
+
+    for (slept = 0; slept < mxf->growing_poll_us;
+         slept += MXF_GROWING_SLEEP_SLICE_US) {
+        av_usleep(FFMIN(MXF_GROWING_SLEEP_SLICE_US,
+                        mxf->growing_poll_us - slept));
+        if (ff_check_interrupt(&s->interrupt_callback))
+            return MXF_WAIT_INTERRUPT;
+    }
+
+    reload = mxf_growing_reload_sidecar(s);
+    if (reload == AVERROR(ENOENT)) {
+        int fp = mxf_growing_probe_footer(s);
+
+        if (fp > 0) {
+            res = MXF_WAIT_FINALIZED;
+        } else if (fp == 0) {
+            if (mxf_growing_reassign_after_sidecar_loss(s) >= 0 &&
+                mxf->growing_role == MXF_GROWING_ROLE_WRITER)
+                return MXF_WAIT_ROLE_CHANGED;   /* position is the new resume point */
+        }
+        /* the index did not advance, it vanished: not progress either way */
+    } else if (reload > 0) {
+        mxf->growing_last_index_progress_us = now;
+    }
+
+    now = av_gettime_relative();
+    if (mxf->growing_role == MXF_GROWING_ROLE_READER &&
+        now - mxf->growing_last_index_progress_us >= mxf->growing_index_stall_us &&
+        now - mxf->growing_last_takeover_try_us >= mxf->growing_index_stall_us) {
+        mxf->growing_last_takeover_try_us = now;
+        if (mxf_growing_attempt_takeover(s) >= 0 &&
+            mxf->growing_role == MXF_GROWING_ROLE_WRITER)
+            return MXF_WAIT_ROLE_CHANGED;       /* position is the new resume point */
+    }
+
+    if (now - mxf->growing_last_probe_us >= MXF_GROWING_FOOTER_PROBE_US) {
+        mxf->growing_last_probe_us = now;
+        if (mxf_growing_probe_footer(s) > 0)
+            res = MXF_WAIT_FINALIZED;
+    }
+
+    if (avio_seek(s->pb, saved, SEEK_SET) < 0) {
+        av_log(s, AV_LOG_ERROR, "growing MXF: cannot re-seek to %"PRId64"; the "
+               "input does not support range requests\n", saved);
+        return MXF_WAIT_ERROR;
+    }
+    return res;
+}
+
+/**
+ * Open-time role assignment, replacing the old always-both-roles design.
+ *
+ * A file that already has a footer gets no role and no sidecar of its own -
+ * just a best-effort cleanup of a stale one left by an earlier growing
+ * session. A still-growing file with a sidecar requested attempts the write
+ * lock: acquired makes this process the writer (which measures the stride
+ * and seeds the duration - a reader never does either, it reads them back
+ * from the sidecar the writer maintains); refused makes it a reader loading
+ * whatever the writer has already published.
+ *
+ * @param essence_offset the first essence KLV's offset, as found by the
+ *                        header parse loop - passed through to
+ *                        mxf_growing_measure_stride() when this process
+ *                        becomes the writer.
+ */
+static int mxf_growing_assign_role(AVFormatContext *s, int64_t essence_offset)
+{
+    MXFContext *mxf = s->priv_data;
+    MXFTrack *ref;
+    int ret;
+
+    if (!mxf->growing) {
+        mxf_growing_cleanup_stale_sidecar(s);
+        return 0;
+    }
+
+    if (mxf->growing_index_stall_us < mxf->growing_poll_us)
+        mxf->growing_index_stall_us = mxf->growing_poll_us;
+
+    mxf_growing_select_ref_stream(s);
+    if (mxf->growing_ref_stream < 0) {
+        av_log(s, AV_LOG_ERROR, "growing MXF: no usable stream\n");
+        return AVERROR_INVALIDDATA;
+    }
+    if (!mxf->growing_vbr_index) {
+        mxf->growing_vbr_index = av_mallocz(sizeof(*mxf->growing_vbr_index));
+        if (!mxf->growing_vbr_index)
+            return AVERROR(ENOMEM);
+    }
+
+    ref = mxf_growing_ref_track(s);
+    /* A file still being written carries an Open header partition (ffmpeg's
+     * own muxer never closes it until the footer is written, and cannot at
+     * all on a non-seekable output), so this is a warning and not a
+     * precondition. */
+    if (mxf->partitions_count > 0 && !mxf->partitions[0].closed)
+        av_log(s, AV_LOG_WARNING, "growing MXF: header partition is open; "
+               "using the structural metadata it contains\n");
+    mxf->growing_clip_wrapped = ref && ref->wrapping == ClipWrapped;
+
+    /* Decide the role before anything walks the essence forward: a reader
+     * must never independently measure the stride or index the reference
+     * track - this one change is the fix for the old patch's root defect. */
+    ret = mxf_growing_try_claim_sidecar(s);
+    if (ret < 0)
+        return ret;
+
+    if (mxf->growing_role == MXF_GROWING_ROLE_WRITER) {
+        if (!mxf->growing_clip_wrapped) {
+            mxf_growing_measure_stride(s, essence_offset);
+            /* the sidecar was opened before the stride could be known (a
+             * clip-wrapped essence's stride isn't derivable until the essence
+             * containers/index tables are computed, later in
+             * mxf_read_header()) - patch it now if this measurement found one */
+            mxf_growing_patch_sidecar_header(s);
+        }
+        if (mxf->growing_stride > 0) {
+            /* seed the duration now: mxf_compute_index_tables() below reads
+             * track->original_duration to fill a zero IndexDuration */
+            int64_t dur = mxf_growing_compute_duration(s);
+            if (dur != AV_NOPTS_VALUE && dur > 0) {
+                for (int i = 0; i < s->nb_streams; i++) {
+                    AVStream *st = s->streams[i];
+                    MXFTrack *tr = st->priv_data;
+                    if (!tr || !tr->edit_rate.num || !ref->edit_rate.num)
+                        continue;
+                    tr->original_duration = av_rescale_q(dur, av_inv_q(ref->edit_rate),
+                                                         av_inv_q(tr->edit_rate));
+                    st->duration = av_rescale_q(dur, av_inv_q(ref->edit_rate),
+                                                st->time_base);
+                }
+            }
+        }
+        mxf->growing_last_progress_us = av_gettime_relative();
+    } else {
+        mxf->growing_last_index_progress_us = av_gettime_relative();
+    }
+
+    mxf->growing_last_takeover_try_us = av_gettime_relative();
+    /* back-date so the first wait probes for a footer immediately. Do NOT
+     * use INT64_MIN here: the cadence check subtracts this from
+     * av_gettime_relative() and would overflow, so the probe would never
+     * fire. */
+    mxf->growing_last_probe_us = av_gettime_relative() - MXF_GROWING_FOOTER_PROBE_US;
+    mxf->growing_last_size     = avio_size(s->pb);
+    av_dict_set(&s->metadata, "growing", "1", 0);
+    /* observability only, for the multi-process test harness: which role this
+     * process ended up with is otherwise only visible via debug logs */
+    av_dict_set(&s->metadata, "growing_role",
+                mxf->growing_role == MXF_GROWING_ROLE_WRITER ? "writer" : "reader", 0);
+    return 0;
+}
+
+/* --- growing to closed transition, and the blocking seek ----------------- */
+
+/**
+ * Called once a footer partition has been confirmed. Parses the footer's index
+ * table segments, rebuilds the index tables and publishes the final duration.
+ *
+ * The structural metadata is deliberately NOT re-parsed: it would duplicate
+ * the streams created from the header partition.
+ *
+ * NOTE: this frees and rebuilds mxf->index_tables, so it has exactly one call
+ * site - the top of mxf_read_packet(), before anything takes a pointer into
+ * that array. mxf_read_seek() holds &mxf->index_tables[0] in a local, so
+ * transitioning from the shared wait would be a use-after-free.
+ */
+static int mxf_growing_transition_to_closed(AVFormatContext *s)
+{
+    MXFContext *mxf = s->priv_data;
+    int64_t saved = avio_tell(s->pb);
+    KLVPacket klv;
+    int ret, i;
+
+    /* mxf_read_random_index_pack() resets the position to run_in, so this whole
+     * function has to restore it */
+    if (!mxf->footer_partition)
+        mxf_read_random_index_pack(s);
+
+    if (mxf->footer_partition) {
+        ret = avio_seek(s->pb, mxf->run_in + mxf->footer_partition, SEEK_SET);
+        if (ret >= 0) {
+            /* parse the footer's KLVs, collecting index table segments */
+            while (!avio_feof(s->pb)) {
+                const MXFMetadataReadTableEntry *metadata;
+
+                ret = klv_read_packet(mxf, &klv, s->pb);
+                if (ret < 0)
+                    break;
+                if (mxf_is_essence_element_key(klv.key) ||
+                    IS_KLV_KEY(klv.key, ff_mxf_random_index_pack_key))
+                    break;
+                if (mxf_is_partition_pack_key(klv.key)) {
+                    avio_skip(s->pb, klv.length);
+                    continue;
+                }
+                for (metadata = mxf_metadata_read_table; metadata->read; metadata++) {
+                    if (IS_KLV_KEY(klv.key, metadata->key)) {
+                        mxf_parse_klv(mxf, klv, metadata->read, metadata->ctx_size,
+                                      metadata->type);
+                        break;
+                    }
+                }
+                if (!metadata->read)
+                    avio_skip(s->pb, klv.length);
+            }
+        }
+
+        for (i = 0; i < mxf->nb_index_tables; i++) {
+            av_freep(&mxf->index_tables[i].segments);
+            av_freep(&mxf->index_tables[i].ptses);
+            av_freep(&mxf->index_tables[i].fake_index);
+            av_freep(&mxf->index_tables[i].offsets);
+        }
+        av_freep(&mxf->index_tables);
+        mxf->nb_index_tables = 0;
+        mxf_compute_index_tables(mxf);
+    }
+
+    /* publish the final duration */
+    for (i = 0; i < s->nb_streams; i++) {
+        AVStream *st = s->streams[i];
+        MXFTrack *track = st->priv_data;
+        MXFIndexTable *t;
+
+        if (!track)
+            continue;
+        t = mxf_find_index_table(mxf, track->index_sid);
+        if (t && t->nb_ptses > 0) {
+            st->duration           = t->nb_ptses;
+            track->original_duration = t->nb_ptses;
+        }
+    }
+
+    /* leaving growing mode disables the poll loop; do it before the last
+     * refresh so the refresh sees the footer-clamped file size */
+    mxf->growing = 0;
+    av_dict_set(&s->metadata, "growing", "0", 0);
+
+    /* completion is signaled solely by deleting the sidecar - only the
+     * writer that reaches the true end does this; a reader that detects the
+     * footer independently (via its own probe, or by walking into the footer
+     * partition itself) just reverts, leaving the file for the writer (or a
+     * later mxf_growing_cleanup_stale_sidecar() pass) to remove */
+    if (mxf->growing_role == MXF_GROWING_ROLE_WRITER && mxf->growing_index_out) {
+        remove(mxf->growing_index_file);
+        mxf_growing_release_sidecar_write(mxf);
+    }
+    mxf->growing_role = MXF_GROWING_ROLE_NONE;
+
+    av_log(s, AV_LOG_INFO, "growing MXF: footer reached, switched to closed "
+           "mode\n");
+
+    if (avio_seek(s->pb, saved, SEEK_SET) < 0)
+        return AVERROR(EIO);
+    return 0;
+}
+
+/**
+ * Block until edit unit sample_time of stream_index is readable.
+ *
+ * INVARIANT: mutates no demuxer state other than the growing-mode duration and
+ * index caches. The AVIO position, mxf->current_klv_data, every
+ * track->sample_count and every cur_dts are untouched on every return path, so
+ * a subsequent mxf_read_packet() resumes exactly where it was. That is what
+ * makes returning AVERROR_EOF from here safe. Do NOT be tempted to clamp
+ * sample_time in here.
+ *
+ * @return 0            the target is available, or availability is unknowable
+ *         AVERROR_EOF  the file finalized shorter than the target, or the
+ *                      stall timeout expired
+ *         AVERROR_EXIT the interrupt callback fired
+ */
+static int mxf_growing_wait_for_edit_unit(AVFormatContext *s, int stream_index,
+                                          int64_t sample_time)
+{
+    MXFContext *mxf = s->priv_data;
+    MXFTrack *src = s->streams[stream_index]->priv_data;
+    MXFTrack *ref = mxf_growing_ref_track(s);
+    int64_t ref_target, avail, prev_avail = -1;
+
+    if (!mxf->growing || !src || !ref || sample_time <= 0)
+        return 0;
+    if (!src->edit_rate.num || !ref->edit_rate.num)
+        return 0;
+
+    /* availability is counted in reference-track edit units */
+    ref_target = av_rescale_q(sample_time, av_inv_q(src->edit_rate),
+                              av_inv_q(ref->edit_rate));
+
+    for (;;) {
+        avail = mxf_growing_available_edit_units(s);
+
+        if (avail == AV_NOPTS_VALUE) {
+            av_log(s, AV_LOG_WARNING, "growing MXF: cannot determine the live "
+                   "duration (no stride, no EditUnitByteCount and no sidecar "
+                   "entries); not blocking on this seek\n");
+            return 0;
+        }
+        if (ref_target < avail) {
+            /* republish before the caller computes an offset against a cached
+             * duration */
+            mxf_growing_refresh_duration(s);
+            return 0;
+        }
+        if (mxf->growing_file_closed) {
+            av_log(s, AV_LOG_ERROR, "growing MXF: seek target edit unit "
+                   "%"PRId64" is past the final duration %"PRId64"\n",
+                   ref_target, avail);
+            return AVERROR_EOF;
+        }
+        if (avail > prev_avail) {
+            prev_avail = avail;
+            mxf_growing_note_progress(mxf);
+            mxf_growing_refresh_duration(s);
+        }
+
+        switch (mxf->growing_role == MXF_GROWING_ROLE_READER
+                ? mxf_growing_reader_wait_step(s)
+                : mxf_growing_wait_step(s)) {
+        case MXF_WAIT_RETRY:
+        case MXF_WAIT_FINALIZED:
+        case MXF_WAIT_ROLE_CHANGED:
+            /* FINALIZED does not mean "stop now": the writer may have appended
+             * the last essence AND the footer since our last look, so re-test
+             * availability. The growing_file_closed branch above then decides.
+             * ROLE_CHANGED (reader took over as writer) is likewise just a
+             * reason to re-test: mxf_growing_available_edit_units() is
+             * role-aware and picks up the new role on its own. */
+            continue;
+        case MXF_WAIT_TIMEOUT:
+            return AVERROR_EOF;
+        case MXF_WAIT_INTERRUPT:
+            return AVERROR_EXIT;
+        default:
+            return AVERROR(EIO);
+        }
+    }
+}
+
 static void mxf_read_random_index_pack(AVFormatContext *s)
 {
     MXFContext *mxf = s->priv_data;
@@ -3872,7 +5844,21 @@ static int mxf_read_header(AVFormatContext *s)
         return AVERROR_INVALIDDATA;
     mxf->run_in = run_in;
 
+    /* Always read the RIP, even in growing mode: if the writer finished before
+     * we opened the file we want the real footer index rather than a stride
+     * estimate. Safe on a genuinely growing file - the RIP check validates
+     * klv.next_klv == file_size, so trailing essence cannot be mistaken for a
+     * RIP, and it leaves the position at mxf->run_in either way. */
     mxf_read_random_index_pack(s);
+
+    /* Mode is decided solely by growing_index_file's presence plus
+     * footer-absence - there is no separate user flag any more. The final
+     * decision cannot be made yet: some multi-partition MXF files are legally
+     * closed with no trailing RandomIndexPack, and footer-partition presence
+     * may only become known later in the partition walk below (a body
+     * partition's own PartitionPack can carry FooterPartition). Deciding here
+     * would latch a stale "growing" verdict and break header parsing of such
+     * a closed file at its first essence KLV. */
 
     while (!avio_feof(s->pb)) {
         size_t x;
@@ -3908,6 +5894,16 @@ static int mxf_read_header(AVFormatContext *s)
             if (!essence_offset)
                 essence_offset = klv.offset;
 
+            /* Final growing/non-growing decision: test the current (possibly
+             * just-updated-by-this-walk) footer_partition rather than a value
+             * latched before the walk started. If still unknown, this is a
+             * growing file (or one about to be treated as such) - stop header
+             * parsing as soon as we find essence. */
+            if (mxf->growing_index_file && !mxf->footer_partition) {
+                mxf->growing = 1;
+                break;
+            }
+
             /* seek to footer, previous partition or stop */
             if (mxf_parse_handle_essence(mxf) <= 0)
                 break;
@@ -3939,6 +5935,13 @@ static int mxf_read_header(AVFormatContext *s)
             avio_skip(s->pb, klv.length);
         }
     }
+
+    if (mxf->growing_index_file && !mxf->growing) {
+        av_log(s, AV_LOG_INFO, "growing MXF: a footer is already present, "
+               "opening as a closed file\n");
+        av_dict_set(&s->metadata, "growing", "0", 0);
+    }
+
     /* FIXME avoid seek */
     if (!essence_offset)  {
         av_log(s, AV_LOG_ERROR, "no essence\n");
@@ -3950,6 +5953,17 @@ static int mxf_read_header(AVFormatContext *s)
      * to be able to fill in zero IndexDurations with st->duration */
     if ((ret = mxf_parse_structural_metadata(mxf)) < 0)
         return ret;
+
+    /* ---- growing phase A: everything mxf_handle_missing_index_segment() and
+     * mxf_compute_index_tables() depend on. They consume st->duration and
+     * track->original_duration to fill a zero IndexDuration, so the role
+     * (which decides whether this process may measure the stride at all) and
+     * the seed duration have to be established first. ---- */
+    if (mxf->growing_index_file) {
+        ret = mxf_growing_assign_role(s, essence_offset);
+        if (ret < 0)
+            return ret;
+    }
 
     for (int i = 0; i < s->nb_streams; i++)
         mxf_handle_missing_index_segment(mxf, s->streams[i]);
@@ -3971,6 +5985,86 @@ static int mxf_read_header(AVFormatContext *s)
     for (int i = 0; i < s->nb_streams; i++)
         mxf_compute_edit_units_per_packet(mxf, s->streams[i]);
 
+    /* ---- growing phase B: needs p->essence_offset from
+     * mxf_compute_essence_containers() and, for clip-wrapped essence, the
+     * EditUnitByteCount that mxf_handle_missing_index_segment() or a real
+     * IndexTableSegment supplies. Only reached with an assigned role - a
+     * closed file with growing_index_file set got only a stale-sidecar
+     * cleanup in mxf_growing_assign_role() and has nothing more to do. ---- */
+    if (mxf->growing_role != MXF_GROWING_ROLE_NONE) {
+        MXFTrack *ref = mxf_growing_ref_track(s);
+
+        for (int i = 0; ref && i < mxf->partitions_count; i++) {
+            if (mxf->partitions[i].body_sid == ref->body_sid &&
+                mxf->partitions[i].essence_offset > 0) {
+                if (mxf->growing_clip_wrapped)
+                    mxf->growing_essence_offset = mxf->partitions[i].essence_offset;
+                break;
+            }
+        }
+
+        if (mxf->growing_clip_wrapped && ref) {
+            MXFIndexTable *t = mxf_find_index_table(mxf, ref->index_sid);
+            if (t && t->nb_segments > 0 && t->segments[0]->edit_unit_byte_count > 0) {
+                /* one formula covers both wrappings: with elem_size == stride,
+                 * the duration expression collapses to avail / eubc */
+                mxf->growing_stride    = t->segments[0]->edit_unit_byte_count;
+                mxf->growing_elem_size = mxf->growing_stride;
+            }
+            mxf->growing_stride_done = 1;
+            /* the sidecar was opened in mxf_growing_assign_role(), before a
+             * clip-wrapped stride could be known - patch it in now */
+            if (mxf->growing_role == MXF_GROWING_ROLE_WRITER)
+                mxf_growing_patch_sidecar_header(s);
+        }
+
+        /* The sidecar is a consumed interface: if it was asked for, it must
+         * exist and be maintained. Refuse rather than create one that can
+         * never gain an entry - cleaning up anything this process may already
+         * have created so avformat_open_input() failing leaves nothing behind. */
+        if (mxf_growing_refuse_incompatible_essence(s)) {
+            mxf_growing_refuse_cleanup(s);
+            return AVERROR_INVALIDDATA;
+        }
+        if (mxf->growing_stride <= 0 && mxf->growing_clip_wrapped) {
+            av_log(s, AV_LOG_ERROR, "growing MXF: cannot index clip-wrapped "
+                   "essence with no IndexTableSegment and no derivable "
+                   "EditUnitByteCount; retry without -growing_index_file\n");
+            mxf_growing_refuse_cleanup(s);
+            return AVERROR_INVALIDDATA;
+        }
+
+        if (mxf->growing_role == MXF_GROWING_ROLE_WRITER) {
+            /* For a brand-new sidecar, resume at essence_offset (the local
+             * var from the header parse loop) rather than
+             * mxf->growing_essence_offset. They differ by the leading
+             * system item's size in OP1a: growing_essence_offset is
+             * deliberately the reference track's own first essence element
+             * (mxf_growing_measure_stride()/mxf_growing_observe_klv() only
+             * ever record that, to keep the CBR stride/duration arithmetic
+             * video-to-video), but demuxing below resumes at essence_offset,
+             * the content package's true start - the same offset
+             * mxf_growing_index_ref_klv()'s OP1a fix records for entry 0 via
+             * growing_cp_start_offset. Seeding resume_ofs from
+             * growing_essence_offset instead made entry 0's (correctly
+             * earlier) offset look like it was already indexed - silently
+             * skipped without arming - so the dense-gap guard then saw entry
+             * 1 as a permanent gap and gave up on indexing for good. */
+            mxf->growing_index_resume_ofs = mxf->growing_vbr_index->nb_entries
+                ? mxf->growing_vbr_index->offsets[mxf->growing_vbr_index->nb_entries - 1]
+                : essence_offset;
+            mxf->growing_index_armed    = 0;
+            mxf->growing_index_last_ofs = INT64_MIN;
+        }
+
+        if (mxf->growing)
+            mxf_growing_refresh_duration(s);
+
+        /* mxf_growing_measure_stride() and the sidecar work restore the AVIO
+         * position, but be explicit: demuxing starts at the first essence KLV */
+        avio_seek(s->pb, essence_offset, SEEK_SET);
+    }
+
     return 0;
 }
 
@@ -3979,6 +6073,12 @@ static int mxf_get_next_track_edit_unit(MXFContext *mxf, MXFTrack *track, int64_
 {
     int64_t a, b, m, offset;
     MXFIndexTable *t = mxf_find_index_table(mxf, track->index_sid);
+
+    /* in growing mode the binary search bound, the index segment duration and
+     * the partition essence length are all latched at open time; refresh them
+     * together so they cannot drift apart */
+    if (mxf->growing)
+        mxf_growing_refresh_duration(mxf->fc);
 
     if (!t || track->original_duration <= 0)
         return -1;
@@ -4091,22 +6191,89 @@ static int mxf_set_audio_pts(MXFContext *mxf, AVCodecParameters *par,
     return 0;
 }
 
+/**
+ * PTS/DTS for a growing reference-track packet, derived from the dense
+ * sidecar's per-edit-unit temporal_offset (mxf_growing_index_ref_klv()'s
+ * MPEG-2/H.264 helpers, for writer or reader alike - a reader's reloaded
+ * mirror has the same entries).
+ *
+ * This reuses mxf_compute_ptses_fake_index()'s DTS convention
+ * (DTS = edit_unit + first_dts, keeping DTS <= PTS) but computes PTS
+ * directly as edit_unit + temporal_offset[edit_unit], not via that
+ * function's scatter/bucket-sort into a ptses[] array: our temporal_offset
+ * is indexed by, and defined relative to, FILE/storage position (the edit
+ * unit that physically holds this packet's data) - the OPPOSITE axis from
+ * the closed file's own IndexTableSegment TemporalOffset field, which is
+ * indexed by DISPLAY position. On that axis the direct formula is exact
+ * (verified against mxf_compute_ptses_fake_index()'s own worked example in
+ * its comment, translating it onto this axis), so first_dts here is the
+ * running MINIMUM of temporal_offset seen so far - not the negated maximum
+ * that function uses, which is the closed-file convention's own axis, not
+ * ours. Stabilizes once the first GOP's offsets have all been observed.
+ *
+ * Leaves pkt->pts/dts untouched (AV_NOPTS_VALUE) if the sidecar does not yet
+ * reach this edit unit - should not happen in practice, since both the
+ * writer (indexes this edit unit earlier in the same mxf_read_packet() KLV
+ * walk) and the reader (blocked on the index frontier before delivering
+ * this far) already guarantee it, but this must never invent a DTS/PTS.
+ */
+static void mxf_growing_set_reordered_pts(MXFContext *mxf, AVPacket *pkt,
+                                          int64_t edit_unit)
+{
+    MXFGrowingIndex *gi = mxf->growing_vbr_index;
+    int8_t off;
+
+    if (!gi || edit_unit < 0 || edit_unit >= gi->nb_entries)
+        return;
+
+    off = gi->temporal_offsets[edit_unit];
+    if (off < gi->min_temporal_offset)
+        gi->min_temporal_offset = off;
+
+    pkt->dts = edit_unit + gi->min_temporal_offset;
+    pkt->pts = edit_unit + off;
+}
+
 static int mxf_set_pts(MXFContext *mxf, AVStream *st, AVPacket *pkt)
 {
     AVCodecParameters *par = st->codecpar;
     MXFTrack *track = st->priv_data;
 
     if (par->codec_type == AVMEDIA_TYPE_VIDEO) {
-        /* see if we have an index table to derive timestamps from */
-        MXFIndexTable *t = mxf_find_index_table(mxf, track->index_sid);
+        /* Growing MPEG-2/H.264 reference track: this MUST take priority over
+         * the container-index branch below. That branch derives PTS/DTS from
+         * the container's own IndexTableSegment, which a live writer
+         * publishes only every EDIT_UNITS_PER_BODY edit units (mxfenc.c) -
+         * up to ~10s behind the write frontier at 25fps. Relying on it here
+         * is exactly the defect this subsystem exists to fix (~40% of
+         * B-frame packets coming back with pts == AV_NOPTS_VALUE). Excludes
+         * intra-only explicitly: there is nothing to reorder, and that
+         * branch already handles it correctly (PTS = EditUnit, DTS left for
+         * utils.c to derive). Codec-gated to MPEG-2/H.264: those are the only
+         * codecs mxf_growing_index_ref_klv() derives temporal_offset for
+         * (see mxf_growing_available_edit_units()) - HEVC/other long-GOP
+         * codecs get temporal_offset == 0 for every entry, which would
+         * silently produce pts == dts here instead of falling through to the
+         * container-index branch that the availability cap already
+         * guarantees is populated for them. */
+        if (mxf->growing_role != MXF_GROWING_ROLE_NONE &&
+            st->index == mxf->growing_ref_stream && mxf->growing_vbr_index &&
+            !track->intra_only &&
+            (par->codec_id == AV_CODEC_ID_MPEG2VIDEO ||
+             par->codec_id == AV_CODEC_ID_H264)) {
+            mxf_growing_set_reordered_pts(mxf, pkt, track->sample_count);
+        } else {
+            /* see if we have an index table to derive timestamps from */
+            MXFIndexTable *t = mxf_find_index_table(mxf, track->index_sid);
 
-        if (t && track->sample_count < t->nb_ptses) {
-            pkt->dts = track->sample_count + t->first_dts;
-            pkt->pts = t->ptses[track->sample_count];
-        } else if (track->intra_only) {
-            /* intra-only -> PTS = EditUnit.
-             * let utils.c figure out DTS since it can be < PTS if low_delay = 0 (Sony IMX30) */
-            pkt->pts = track->sample_count;
+            if (t && track->sample_count < t->nb_ptses) {
+                pkt->dts = track->sample_count + t->first_dts;
+                pkt->pts = t->ptses[track->sample_count];
+            } else if (track->intra_only) {
+                /* intra-only -> PTS = EditUnit.
+                 * let utils.c figure out DTS since it can be < PTS if low_delay = 0 (Sony IMX30) */
+                pkt->pts = track->sample_count;
+            }
         }
         track->sample_count++;
     } else if (par->codec_type == AVMEDIA_TYPE_AUDIO) {
@@ -4127,15 +6294,116 @@ static int mxf_read_packet(AVFormatContext *s, AVPacket *pkt)
     MXFContext *mxf = s->priv_data;
     int ret;
 
+    /* The one and only call site for the transition: it frees and rebuilds
+     * mxf->index_tables, and nothing below holds a pointer into that array
+     * yet. mxf_read_seek() keeps &mxf->index_tables[0] in a local, so
+     * transitioning from the shared wait would be a use-after-free. */
+    if (mxf->growing && mxf->growing_file_closed) {
+        if ((ret = mxf_growing_transition_to_closed(s)) < 0)
+            return ret;
+    }
+
     while (1) {
         int64_t max_data_size;
         int64_t pos = avio_tell(s->pb);
 
         if (pos < mxf->current_klv_data.next_klv - mxf->current_klv_data.length || pos >= mxf->current_klv_data.next_klv) {
             mxf->current_klv_data = (KLVPacket){{0}};
-            ret = klv_read_packet(mxf, &klv, s->pb);
-            if (ret < 0)
-                break;
+            if (mxf->growing) {
+                /* Growing read: retry across both end-of-data and a KLV the
+                 * writer has not finished, waiting for the file to grow. */
+                int64_t resume_pos = avio_tell(s->pb);
+                int last_try = 0;
+
+                for (;;) {
+                    ret = klv_read_packet(mxf, &klv, s->pb);
+                    if (ret >= 0)
+                        break;
+                    if (!avio_feof(s->pb))
+                        break;                  /* a real error */
+                    if (last_try)
+                        break;                  /* finalized and still short */
+
+                    /* klv_read_packet() may have consumed bytes while syncing */
+                    avio_seek(s->pb, resume_pos, SEEK_SET);
+
+                    if (mxf->growing_role == MXF_GROWING_ROLE_READER) {
+                        switch (mxf_growing_reader_wait_step(s)) {
+                        case MXF_WAIT_RETRY:
+                            break;
+                        case MXF_WAIT_ROLE_CHANGED:
+                            /* this reader just became the writer: resume from
+                             * the sidecar's frontier, not our old blocked
+                             * reader position - the AVIO position is already
+                             * there */
+                            resume_pos = avio_tell(s->pb);
+                            break;
+                        case MXF_WAIT_FINALIZED:
+                            last_try = 1;
+                            break;
+                        case MXF_WAIT_TIMEOUT:
+                            return AVERROR_EOF;
+                        case MXF_WAIT_INTERRUPT:
+                            return AVERROR_EXIT;
+                        default:
+                            return AVERROR(EIO);
+                        }
+                    } else {
+                        switch (mxf_growing_wait_step(s)) {
+                        case MXF_WAIT_RETRY:
+                            break;
+                        case MXF_WAIT_FINALIZED:
+                            /* the writer may have appended the final essence KLV
+                             * AND the footer since our last look, so make one more
+                             * attempt before giving up */
+                            last_try = 1;
+                            break;
+                        case MXF_WAIT_TIMEOUT:
+                            return AVERROR_EOF;
+                        case MXF_WAIT_INTERRUPT:
+                            return AVERROR_EXIT;
+                        default:
+                            return AVERROR(EIO);
+                        }
+                    }
+                }
+                if (ret < 0) {
+                    if (mxf->growing_file_closed) {
+                        mxf_growing_transition_to_closed(s);
+                        return AVERROR_EOF;
+                    }
+                    break;
+                }
+                mxf_growing_refresh_duration(s);
+            } else {
+                ret = klv_read_packet(mxf, &klv, s->pb);
+                if (ret < 0)
+                    break;
+            }
+
+            /* Deterministic finalization: the footer partition pack is a KLV
+             * like any other, so detect it from a key we actually read rather
+             * than peeking at the end of the file. Falls through to skip:
+             * below, which drains the footer's own KLVs. */
+            if (mxf->growing && mxf_is_partition_pack_key(klv.key) &&
+                klv.key[13] == 4) {
+                mxf->growing_file_closed   = 1;
+                mxf->growing_footer_offset = klv.offset - mxf->run_in;
+                if (!mxf->footer_partition)
+                    mxf->footer_partition = mxf->growing_footer_offset;
+                av_log(s, AV_LOG_INFO, "growing MXF: footer partition reached "
+                       "at 0x%"PRIx64"\n", klv.offset);
+            }
+            /* OP1a offset fix (see mxf_growing_index_ref_klv()): remember the
+             * earliest KLV offset since the last content package boundary,
+             * so the entry eventually recorded for the reference track's
+             * essence element points at the content package's start, not the
+             * element's own offset. Writer-only: a reader never indexes. */
+            if (mxf->growing_role == MXF_GROWING_ROLE_WRITER &&
+                mxf->growing_cp_start_offset < 0 &&
+                (IS_KLV_KEY(klv.key, mxf_system_item_key_cp) ||
+                 IS_KLV_KEY(klv.key, mxf_system_item_key_gc)))
+                mxf->growing_cp_start_offset = klv.offset;
             // klv.key[0..3] == mxf_klv_key from here forward
             max_data_size = klv.length;
             pos = klv.next_klv - klv.length;
@@ -4172,6 +6440,35 @@ static int mxf_read_packet(AVFormatContext *s, AVPacket *pkt)
             st = s->streams[index];
             track = st->priv_data;
 
+            /* A frame-wrapped KLV is returned whole, so it must be fully
+             * written; klv.next_klv is the real packet end here. */
+            if (mxf->growing && track && track->wrapping == FrameWrapped &&
+                mxf_growing_incomplete(s, klv.next_klv)) {
+                int act = mxf_growing_wait_for_data(s, klv.offset);
+
+                if (act < 0)
+                    return act;
+                if (act == 0) {
+                    /* finalized while short: this edit unit never completes */
+                    mxf_growing_transition_to_closed(s);
+                    return AVERROR_EOF;
+                }
+                mxf->current_klv_data = (KLVPacket){{0}};
+                continue;
+            }
+
+            /* Index and observe BEFORE the discard check: with -map 0:a on a
+             * video-reference file the reference stream is discarded, and
+             * skipping this would silently stop extending the sidecar.
+             * Writer-only: a reader trusts the sidecar the writer maintains
+             * and never independently measures or indexes anything itself -
+             * this is the fix for the old patch's root defect. */
+            if (mxf->growing && mxf->growing_role == MXF_GROWING_ROLE_WRITER) {
+                mxf_growing_observe_klv(s, &klv, index);
+                if (index == mxf->growing_ref_stream && !mxf->growing_clip_wrapped)
+                    mxf_growing_index_ref_klv(s, &klv, st, track);
+            }
+
             if (s->streams[index]->discard == AVDISCARD_ALL)
                 goto skip;
 
@@ -4202,6 +6499,22 @@ static int mxf_read_packet(AVFormatContext *s, AVPacket *pkt)
                 klv.offset = pos;
                 klv.length = size;
                 klv.next_klv = klv.offset + klv.length;
+
+                /* Clip-wrapped: only this edit-unit sub-range has to be
+                 * present, not the whole KLV. current_klv_data is left set so
+                 * the retry re-enters through the reuse branch at the top of
+                 * the loop instead of trying to re-read a key mid-essence. */
+                if (mxf->growing && mxf_growing_incomplete(s, klv.next_klv)) {
+                    int act = mxf_growing_wait_for_data(s, pos);
+
+                    if (act < 0)
+                        return act;
+                    if (act == 0) {
+                        mxf_growing_transition_to_closed(s);
+                        return AVERROR_EOF;
+                    }
+                    continue;
+                }
             }
 
             /* check for 8 channels AES3 element */
@@ -4238,6 +6551,13 @@ static int mxf_read_packet(AVFormatContext *s, AVPacket *pkt)
 
             /* seek for truncated packets */
             avio_seek(s->pb, klv.next_klv, SEEK_SET);
+
+            /* Delivering a packet is the definition of progress for the stall
+             * timer. Note it here rather than on a successful klv_read_packet():
+             * an incomplete KLV is re-read on every retry, and counting that as
+             * progress reset the timer forever. */
+            if (mxf->growing)
+                mxf_growing_note_progress(mxf);
 
             return 0;
         } else {
@@ -4279,6 +6599,20 @@ static int mxf_read_close(AVFormatContext *s)
         }
     }
     av_freep(&mxf->index_tables);
+
+    if (mxf->growing_index_out) {
+        /* safety net: normally mxf_growing_transition_to_closed() has already
+         * deleted the sidecar (that IS the completion signal) by the time
+         * close runs, but the caller may stop reading right after the last
+         * packet without one further mxf_read_packet() call to trigger it */
+        if (mxf->growing_file_closed)
+            remove(mxf->growing_index_file);
+        mxf_growing_release_sidecar_write(mxf);
+    }
+    mxf_growing_free_index(mxf);
+    if (mxf->growing_h264_parser)
+        av_parser_close(mxf->growing_h264_parser);
+    avcodec_free_context(&mxf->growing_h264_avctx);
 
     return 0;
 }
@@ -4327,6 +6661,61 @@ static int mxf_read_seek(AVFormatContext *s, int stream_index, int64_t sample_ti
     if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
         sample_time = av_rescale_q(sample_time, st->time_base,
                                    av_inv_q(source_track->edit_rate));
+
+    /* In growing mode a target past the live edge blocks until it arrives
+     * rather than silently clamping. This must happen before anything takes a
+     * pointer into mxf->index_tables, which the transition can rebuild. */
+    if (mxf->growing) {
+        ret = mxf_growing_wait_for_edit_unit(s, stream_index, sample_time);
+        if (ret < 0)
+            return ret;
+    }
+
+    /* growing VBR: the sidecar index is the only source of frame offsets */
+    if (mxf->growing && mxf->growing_vbr_index) {
+        MXFGrowingIndex *gi;
+        MXFTrack *ref = mxf_growing_ref_track(s);
+
+        mxf_growing_reload_sidecar(s);
+        gi = mxf->growing_vbr_index;
+        if (gi->nb_entries > 0 && mxf->nb_index_tables <= 0 && ref &&
+            ref->edit_rate.num && source_track->edit_rate.num) {
+            /* the sidecar is dense in REFERENCE-track edit units while
+             * sample_time is in the seeking stream's, so rescale - without
+             * this an audio seek indexes the array with a sample count */
+            int64_t ref_eu = av_rescale_q(FFMAX(sample_time, 0),
+                                          av_inv_q(source_track->edit_rate),
+                                          av_inv_q(ref->edit_rate));
+
+            if (ref_eu >= gi->nb_entries) {
+                /* the wait established availability, so this means the sidecar
+                 * was truncated under us. Never clamp. */
+                av_log(s, AV_LOG_ERROR, "growing MXF: sidecar shrank during the "
+                       "seek (%"PRId64" entries, wanted %"PRId64")\n",
+                       gi->nb_entries, ref_eu);
+                return AVERROR_EOF;
+            }
+            seekpos = avio_seek(s->pb, gi->offsets[ref_eu], SEEK_SET);
+            if (seekpos < 0)
+                return seekpos;
+            avpriv_update_cur_dts(s, st, sample_time);
+            mxf->current_klv_data = (KLVPacket){{0}};
+            for (int i = 0; i < s->nb_streams; i++) {
+                AVStream *cur_st = s->streams[i];
+                MXFTrack *cur_track = cur_st->priv_data;
+                if (cur_track) {
+                    int64_t track_edit_unit = sample_time;
+                    if (st != cur_st)
+                        mxf_get_next_track_edit_unit(mxf, cur_track,
+                                                     gi->offsets[ref_eu],
+                                                     &track_edit_unit);
+                    cur_track->sample_count = mxf_compute_sample_count(mxf, cur_st,
+                                                                        track_edit_unit);
+                }
+            }
+            return 0;
+        }
+    }
 
     if (mxf->nb_index_tables <= 0) {
         if (!s->bit_rate)
@@ -4384,7 +6773,12 @@ static int mxf_read_seek(AVFormatContext *s, int stream_index, int64_t sample_ti
         } else {
             /* no IndexEntryArray (one or more CBR segments)
              * make sure we don't seek past the end */
-            sample_time = FFMIN(sample_time, source_track->original_duration - 1);
+            /* In growing mode mxf_growing_wait_for_edit_unit() has already
+             * established that sample_time is available and
+             * mxf_growing_refresh_duration() has re-published
+             * original_duration, so clamping here would undo the wait. */
+            if (!mxf->growing && source_track->original_duration > 0)
+                sample_time = FFMIN(sample_time, source_track->original_duration - 1);
         }
 
         if (source_track->wrapping == UnknownWrapped)
@@ -4427,6 +6821,25 @@ static const AVOption options[] = {
       AV_OPT_FLAG_DECODING_PARAM },
     { "skip_essence_parse", "skip_essence_parse",
       offsetof(MXFContext, skip_essence_parse), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1,
+      AV_OPT_FLAG_DECODING_PARAM },
+    { "growing_poll_us", "microseconds to sleep between EOF polls in growing mode",
+      offsetof(MXFContext, growing_poll_us), AV_OPT_TYPE_INT, {.i64 = 100000}, 1000, 10000000,
+      AV_OPT_FLAG_DECODING_PARAM },
+    { "growing_timeout_us", "microseconds without new data before returning EOF in "
+      "growing mode (0 = wait forever; also applies during "
+      "avformat_find_stream_info, and is required for a blocking seek to be able "
+      "to give up)",
+      offsetof(MXFContext, growing_timeout_us), AV_OPT_TYPE_INT64, {.i64 = 0}, 0, INT64_MAX,
+      AV_OPT_FLAG_DECODING_PARAM },
+    { "growing_index_stall_us", "microseconds the sidecar index may go without "
+      "advancing before a blocked reader attempts to take the write lock; "
+      "retried, never itself a give-up condition",
+      offsetof(MXFContext, growing_index_stall_us), AV_OPT_TYPE_INT64, {.i64 = 2000000}, 0, INT64_MAX,
+      AV_OPT_FLAG_DECODING_PARAM },
+    { "growing_index_file", "local path to the growing-MXF sidecar index file; if given, "
+      "the file is treated as growing only while no footer is present, and the "
+      "sidecar is created and maintained for as long as it does",
+      offsetof(MXFContext, growing_index_file), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0,
       AV_OPT_FLAG_DECODING_PARAM },
     { NULL },
 };
