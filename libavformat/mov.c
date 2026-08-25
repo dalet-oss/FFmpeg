@@ -2688,8 +2688,10 @@ static int mov_codec_id(AVStream *st, uint32_t format)
                     st->codecpar->codec_id == AV_CODEC_ID_NONE)) {
             id = ff_codec_get_id(ff_codec_movsubtitle_tags, format);
             if (id <= 0) {
-                id = (format == MOV_MP4_TTML_TAG || format == MOV_ISMV_TTML_TAG) ?
-                     AV_CODEC_ID_TTML : id;
+                if (format == MOV_MP4_TTML_TAG || format == MOV_ISMV_TTML_TAG)
+                    id = AV_CODEC_ID_TTML;
+                else if (format == MOV_MP4_WEBVTT_TAG)
+                    id = AV_CODEC_ID_WEBVTT;
             }
 
             if (id > 0)
@@ -2897,9 +2899,12 @@ static void mov_parse_stsd_subtitle(MOVContext *c, AVIOContext *pb,
     // color, fonts, and default styles, so fake an atom to read it
     MOVAtom fake_atom = { .size = size };
     // mp4s contains a regular esds atom, dfxp ISMV TTML has no content
-    // in extradata unlike stpp MP4 TTML.
+    // in extradata unlike stpp MP4 TTML. The children of a 14496-30
+    // WVTTSampleEntry are boxes rather than a codec configuration blob, and
+    // the WebVTT decoder takes no extradata, so leave them alone.
     if (st->codecpar->codec_tag != AV_RL32("mp4s") &&
-        st->codecpar->codec_tag != MOV_ISMV_TTML_TAG)
+        st->codecpar->codec_tag != MOV_ISMV_TTML_TAG &&
+        st->codecpar->codec_tag != MOV_MP4_WEBVTT_TAG)
         mov_read_glbl(c, pb, fake_atom);
     st->codecpar->width  = sc->width;
     st->codecpar->height = sc->height;
