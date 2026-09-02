@@ -328,7 +328,22 @@ const char *avio_find_protocol_name(const char *url);
  * checked resource.
  */
 int avio_check(const char *url, int flags);
-int avio_check2(const char *url, int flags, AVDictionary **options);
+
+/**
+ * Variant of avio_check() that accepts protocol options and an interrupt
+ * callback.
+ *
+ * @param options  protocol options to apply to the probe. Both the generic
+ *                 URLContext options (e.g. rw_timeout) and the protocol
+ *                 private options are set from this dictionary, and the
+ *                 dictionary is passed on to nested protocols, so that a
+ *                 probe is bounded by the same timeouts as a real open.
+ * @param int_cb   interrupt callback to install on the probe, or NULL. Without
+ *                 one a probe that blocks in the nested protocol cannot be
+ *                 aborted.
+ */
+int avio_check2(const char *url, int flags, AVDictionary **options,
+                const AVIOInterruptCB *int_cb);
 
 /**
  * Open directory for reading.
