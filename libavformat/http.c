@@ -2246,12 +2246,61 @@ static const AVClass flavor ## _context_class = {   \
     .version    = LIBAVUTIL_VERSION_INT,            \
 }
 
+#if CONFIG_HTTP_PROTOCOL || CONFIG_HTTPS_PROTOCOL
+/**
+ * Existence probe used by avio_check()/avio_check2().
+ *
+ * Without this the generic path in avio_check2() falls back to ffurl_connect(),
+ * which for http means a GET: the server starts sending a body that is
+ * discarded as soon as the probe closes the context. For an image2 sequence on
+ * object storage that turns every existence probe into a full object fetch.
+ * Issue a HEAD instead.
+ */
+static int http_url_check(URLContext *h, int flags, AVDictionary **options)
+{
+    HTTPContext *s = h->priv_data;
+    int had_explicit_method = !!s->method;
+    int ret;
+
+    /* A write probe would have to create the resource; keep the previous
+     * behaviour for those. */
+    if (flags & AVIO_FLAG_WRITE) {
+        ret = ffurl_connect(h, options);
+        return ret < 0 ? ret : flags;
+    }
+
+    /* Honour an explicitly requested method, otherwise probe with HEAD. */
+    if (!s->method) {
+        s->method = av_strdup("HEAD");
+        if (!s->method)
+            return AVERROR(ENOMEM);
+    }
+
+    ret = ffurl_connect(h, options);
+    if (ret < 0 && !had_explicit_method) {
+        /* Some servers/CDNs reject HEAD (404/405) for a resource a GET can
+         * fetch. Retry once with GET before reporting non-existence. */
+        av_freep(&s->method);
+        s->method = av_strdup("GET");
+        if (!s->method)
+            return AVERROR(ENOMEM);
+        ret = ffurl_connect(h, options);
+    }
+    if (ret < 0)
+        return ret;
+
+    return AVIO_FLAG_READ;
+}
+
+#endif
+
 #if CONFIG_HTTP_PROTOCOL
 HTTP_CLASS(http);
 
 const URLProtocol ff_http_protocol = {
     .name                = "http",
     .url_open2           = http_open,
+    .url_check           = http_url_check,
     .url_accept          = http_accept,
     .url_handshake       = http_handshake,
     .url_read            = http_read,
@@ -2274,6 +2323,7 @@ HTTP_CLASS(https);
 const URLProtocol ff_https_protocol = {
     .name                = "https",
     .url_open2           = http_open,
+    .url_check           = http_url_check,
     .url_read            = http_read,
     .url_write           = http_write,
     .url_seek            = http_seek,
