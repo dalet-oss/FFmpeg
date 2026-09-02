@@ -662,31 +662,49 @@ const char *avio_find_protocol_name(const char *url)
     return p ? p->name : NULL;
 }
 
-int avio_check2(const char *url, int flags, AVDictionary **options)
+int avio_check2(const char *url, int flags, AVDictionary **options,
+                const AVIOInterruptCB *int_cb)
 {
     URLContext *h;
-    int ret = ffurl_alloc(&h, url, flags, NULL);
+    AVDictionary *tmp = NULL;
+    int ret = ffurl_alloc(&h, url, flags, int_cb);
     if (ret < 0)
         return ret;
 
-    if (h->prot->priv_data_class)
-        av_opt_set_dict(h->priv_data, options);
+    /* Apply the generic URLContext options (rw_timeout) before the protocol
+     * private ones, mirroring ffurl_open_whitelist(). Nested protocols inherit
+     * the generic options through av_opt_copy(), so setting rw_timeout here is
+     * what makes the probe time-bounded even when the protocol opens a child
+     * (tcp under http). Work on a copy so the caller's dictionary is not
+     * consumed. */
+    if (options) {
+        if ((ret = av_dict_copy(&tmp, *options, 0)) < 0)
+            goto done;
+        if ((ret = av_opt_set_dict(h, &tmp)) < 0)
+            goto done;
+        if (h->prot->priv_data_class &&
+            (ret = av_opt_set_dict(h->priv_data, &tmp)) < 0)
+            goto done;
+    }
 
     if (h->prot->url_check) {
         ret = h->prot->url_check(h, flags, options);
     } else {
+        /* Pass the options down so that nested protocols see them too. */
         ret = ffurl_connect(h, options);
         if (ret >= 0)
             ret = flags;
     }
 
+done:
+    av_dict_free(&tmp);
     ffurl_close(h);
     return ret;
 }
 
 int avio_check(const char *url, int flags)
 {
-    return avio_check2(url, flags, NULL);
+    return avio_check2(url, flags, NULL, NULL);
 }
 
 int ffurl_move(const char *url_src, const char *url_dst)
