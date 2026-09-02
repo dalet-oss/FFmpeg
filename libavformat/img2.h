@@ -65,6 +65,7 @@ typedef struct VideoDemuxData {
     int reconnect_on_network_error;
     char *reconnect_on_http_error;
     int timeout;
+    int recv_buffer_size;
 } VideoDemuxData;
 
 typedef struct IdStrMap {
