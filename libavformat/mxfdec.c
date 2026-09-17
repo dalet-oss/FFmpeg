@@ -402,10 +402,11 @@ typedef struct MXFContext {
     MXFGrowingIndex *growing_vbr_index;
     int64_t     growing_sidecar_duration;   ///< reader: last duration value read from the sidecar header
     int64_t     growing_index_resume_ofs;   ///< offset that (re)arms appending: first-time-writer start, or takeover/restart resume point
-    /* TEMP DIAGNOSTIC (RDC-15459): set by a growing seek, consumed by the
-     * very next klv_read_packet() so the seek's actual landing spot is
-     * observed via the read that would happen anyway - no extra I/O added. */
-    int         growing_diag_pending;
+    /* TEMP DIAGNOSTIC (RDC-15459): set by a growing seek, consumed over the
+     * next several klv_read_packet() calls so both the seek's landing spot
+     * and the normal forward reads right after it are observed via reads
+     * that would happen anyway - no extra I/O added. */
+    int         growing_diag_remaining;
     int64_t     growing_diag_target;
     int         growing_index_armed;
     int64_t     growing_index_last_ofs;     ///< offset of the last appended entry
@@ -592,28 +593,35 @@ static int klv_read_packet(MXFContext *mxf, KLVPacket *klv, AVIOContext *pb)
 {
     int64_t length, pos;
     int llen;
-    /* TEMP DIAGNOSTIC (RDC-15459): consume any pending growing-seek report
-     * on this, the very next read after that seek - purely observational,
-     * no extra I/O beyond avio_tell() (in-memory, no syscall). */
-    int diag_pending = mxf->growing_diag_pending;
+    /* TEMP DIAGNOSTIC (RDC-15459): report each of the next several reads
+     * after a growing seek, not just the first - purely observational, no
+     * extra I/O beyond avio_tell() (in-memory, no syscall). A seek landing
+     * exactly on target does not rule out the race: it can also show up a
+     * few packets further into the normal forward reading that follows.
+     * pos_before should always equal the previous read's klv_offset (reads
+     * are back-to-back on the same AVIOContext); a mismatch means
+     * mxf_read_sync_klv() had to skip bytes to resync. */
+    int diag_active = mxf->growing_diag_remaining > 0;
     int64_t diag_target = mxf->growing_diag_target;
-    int64_t diag_pos_before = diag_pending ? avio_tell(pb) : 0;
-    mxf->growing_diag_pending = 0;
+    int64_t diag_pos_before = diag_active ? avio_tell(pb) : 0;
+    int diag_step = diag_active ? mxf->growing_diag_remaining : 0;
+    if (diag_active)
+        mxf->growing_diag_remaining--;
 
     if (!mxf_read_sync_klv(pb)) {
-        if (diag_pending)
+        if (diag_active)
             av_log(mxf->fc, AV_LOG_WARNING,
-                   "growing MXF DIAG: seek target=%"PRId64" pos_before=%"PRId64
+                   "growing MXF DIAG: step=%d target=%"PRId64" pos_before=%"PRId64
                    " - sync_klv found no KLV key (hit EOF first)\n",
-                   diag_target, diag_pos_before);
+                   diag_step, diag_target, diag_pos_before);
         return AVERROR_INVALIDDATA;
     }
     klv->offset = avio_tell(pb) - 4;
-    if (diag_pending)
+    if (diag_active)
         av_log(mxf->fc, AV_LOG_WARNING,
-               "growing MXF DIAG: seek target=%"PRId64" pos_before=%"PRId64
+               "growing MXF DIAG: step=%d target=%"PRId64" pos_before=%"PRId64
                " klv_offset=%"PRId64" drift=%"PRId64"\n",
-               diag_target, diag_pos_before, klv->offset, klv->offset - diag_target);
+               diag_step, diag_target, diag_pos_before, klv->offset, klv->offset - diag_pos_before);
     if (klv->offset < mxf->run_in)
         return AVERROR_INVALIDDATA;
 
@@ -7089,10 +7097,11 @@ static int mxf_read_seek(AVFormatContext *s, int stream_index, int64_t sample_ti
             if (seekpos < 0)
                 return seekpos;
 
-            /* TEMP DIAGNOSTIC (RDC-15459): let the very next klv_read_packet()
-             * report where this seek actually landed, using the read that
-             * would happen anyway - adds no extra I/O of its own. */
-            mxf->growing_diag_pending = 1;
+            /* TEMP DIAGNOSTIC (RDC-15459): let the next several
+             * klv_read_packet() calls report where this seek landed and how
+             * the forward reads right after it go, using reads that would
+             * happen anyway - adds no extra I/O of its own. */
+            mxf->growing_diag_remaining = 10;
             mxf->growing_diag_target = target_offset;
 
             avpriv_update_cur_dts(s, st, sample_time);
@@ -7157,10 +7166,11 @@ static int mxf_read_seek(AVFormatContext *s, int stream_index, int64_t sample_ti
             if (seekpos < 0)
                 return seekpos;
 
-            /* TEMP DIAGNOSTIC (RDC-15459): let the very next klv_read_packet()
-             * report where this seek actually landed, using the read that
-             * would happen anyway - adds no extra I/O of its own. */
-            mxf->growing_diag_pending = 1;
+            /* TEMP DIAGNOSTIC (RDC-15459): let the next several
+             * klv_read_packet() calls report where this seek landed and how
+             * the forward reads right after it go, using reads that would
+             * happen anyway - adds no extra I/O of its own. */
+            mxf->growing_diag_remaining = 10;
             mxf->growing_diag_target = gi->offsets[ref_eu];
 
             avpriv_update_cur_dts(s, st, sample_time);
