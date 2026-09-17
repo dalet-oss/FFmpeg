@@ -7065,6 +7065,25 @@ static int mxf_read_seek(AVFormatContext *s, int stream_index, int64_t sample_ti
             seekpos = avio_seek(s->pb, target_offset, SEEK_SET);
             if (seekpos < 0)
                 return seekpos;
+
+            /* TEMP DIAGNOSTIC (RDC-15459): confirm whether the computed CBR
+             * offset lands on a real KLV key. Peeks 16 bytes then seeks back
+             * to target_offset so behaviour is otherwise unchanged. */
+            {
+                uint8_t peek[16] = {0};
+                int nread = avio_read(s->pb, peek, sizeof(peek));
+                int valid_key = nread == 16 && !memcmp(peek, mxf_klv_key, 4);
+                av_log(s, AV_LOG_WARNING,
+                       "growing MXF DIAG: CBR seek ref_eu=%"PRId64" stride=%"PRId64
+                       " essence_offset=%"PRId64" target=%"PRId64" valid_klv=%d "
+                       "bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                       ref_eu, mxf->growing_stride, mxf->growing_essence_offset, target_offset,
+                       valid_key, peek[0], peek[1], peek[2], peek[3], peek[4], peek[5], peek[6],
+                       peek[7], peek[8], peek[9], peek[10], peek[11], peek[12], peek[13], peek[14],
+                       peek[15]);
+                avio_seek(s->pb, target_offset, SEEK_SET);
+            }
+
             avpriv_update_cur_dts(s, st, sample_time);
             mxf->current_klv_data = (KLVPacket){{0}};
             for (int i = 0; i < s->nb_streams; i++) {
@@ -7126,6 +7145,27 @@ static int mxf_read_seek(AVFormatContext *s, int stream_index, int64_t sample_ti
             seekpos = avio_seek(s->pb, gi->offsets[ref_eu], SEEK_SET);
             if (seekpos < 0)
                 return seekpos;
+
+            /* TEMP DIAGNOSTIC (RDC-15459): confirm whether the sidecar's
+             * recorded offset lands on a real KLV key, and show the
+             * neighbouring entries so a drift pattern is visible. Peeks 16
+             * bytes then seeks back so behaviour is otherwise unchanged. */
+            {
+                uint8_t peek[16] = {0};
+                int nread = avio_read(s->pb, peek, sizeof(peek));
+                int valid_key = nread == 16 && !memcmp(peek, mxf_klv_key, 4);
+                int64_t prev_off = ref_eu > 0 ? gi->offsets[ref_eu - 1] : -1;
+                int64_t next_off = ref_eu + 1 < gi->nb_entries ? gi->offsets[ref_eu + 1] : -1;
+                av_log(s, AV_LOG_WARNING,
+                       "growing MXF DIAG: VBR seek ref_eu=%"PRId64" nb_entries=%"PRId64
+                       " prev_off=%"PRId64" target=%"PRId64" next_off=%"PRId64" valid_klv=%d "
+                       "bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                       ref_eu, gi->nb_entries, prev_off, gi->offsets[ref_eu], next_off, valid_key,
+                       peek[0], peek[1], peek[2], peek[3], peek[4], peek[5], peek[6], peek[7],
+                       peek[8], peek[9], peek[10], peek[11], peek[12], peek[13], peek[14], peek[15]);
+                avio_seek(s->pb, gi->offsets[ref_eu], SEEK_SET);
+            }
+
             avpriv_update_cur_dts(s, st, sample_time);
             mxf->current_klv_data = (KLVPacket){{0}};
             for (int i = 0; i < s->nb_streams; i++) {
