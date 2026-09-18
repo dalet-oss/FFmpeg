@@ -533,9 +533,11 @@ static void mxf_free_metadataset(MXFMetadataSet **ctx, enum MXFMetadataSetType t
     av_freep(ctx);
 }
 
-static int64_t klv_decode_ber_length(AVIOContext *pb, int *llen)
+static int64_t klv_decode_ber_length(AVIOContext *pb, int *llen, int *eof_hit)
 {
     uint64_t size = avio_r8(pb);
+    if (eof_hit && avio_feof(pb))
+        *eof_hit = 1;
     if (size & 0x80) { /* long form */
         int bytes_num = size & 0x7f;
         /* SMPTE 379M 5.3.4 guarantee that bytes_num must not exceed 8 bytes */
@@ -544,8 +546,17 @@ static int64_t klv_decode_ber_length(AVIOContext *pb, int *llen)
         if (llen)
             *llen = bytes_num + 1;
         size = 0;
-        while (bytes_num--)
-            size = size << 8 | avio_r8(pb);
+        while (bytes_num--) {
+            uint8_t b = avio_r8(pb);
+            /* Check per byte, not once after the whole loop: a growing
+             * writer can append the missing byte(s) between an EOF hit on
+             * an earlier byte and a check made only after the loop exits,
+             * which would clear avio_feof() and mask the transient EOF that
+             * corrupted this specific read. */
+            if (eof_hit && avio_feof(pb))
+                *eof_hit = 1;
+            size = size << 8 | b;
+        }
     } else if (llen) {
         *llen = 1;
     }
@@ -587,6 +598,7 @@ static int klv_read_packet(MXFContext *mxf, KLVPacket *klv, AVIOContext *pb)
 {
     int64_t length, pos;
     int llen;
+    int eof_hit = 0;
 
     if (!mxf_read_sync_klv(pb))
         return AVERROR_INVALIDDATA;
@@ -598,7 +610,7 @@ static int klv_read_packet(MXFContext *mxf, KLVPacket *klv, AVIOContext *pb)
     int ret = ffio_read_size(pb, klv->key + 4, 12);
     if (ret < 0)
         return ret;
-    length = klv_decode_ber_length(pb, &llen);
+    length = klv_decode_ber_length(pb, &llen, mxf->growing ? &eof_hit : NULL);
     if (length < 0)
         return length;
     klv->length = length;
@@ -614,13 +626,21 @@ static int klv_read_packet(MXFContext *mxf, KLVPacket *klv, AVIOContext *pb)
      * the KLV entirely out of avio_r8()-family reads, which return 0 on EOF
      * instead of propagating an error. A growing reader that catches up to
      * the writer mid-KLV (e.g. between the 16-byte key and its BER length
-     * byte) can read a fake all-zero length here, so treat a feof seen at
-     * this point as a real error - mxf_read_packet()'s growing retry loop
-     * already knows how to wait and retry on avio_feof(), for every earlier
-     * read in this function. Without this, the false "success" desyncs the
-     * reader: the next read looks for a KLV key at the wrong offset and
-     * fails with an un-retryable Invalid data error moments later. */
-    if (mxf->growing && avio_feof(pb))
+     * byte(s)) can read a fake all-zero length here, so treat an EOF seen
+     * during that decode as a real error - mxf_read_packet()'s growing
+     * retry loop already knows how to wait and retry on avio_feof(), for
+     * every earlier read in this function. Without this, the false
+     * "success" desyncs the reader: the next read looks for a KLV key at
+     * the wrong offset and fails with an un-retryable Invalid data error
+     * moments later.
+     *
+     * eof_hit is set by klv_decode_ber_length() itself, per byte, rather
+     * than relying solely on avio_feof(pb) here: for a long-form (multi-
+     * byte) length, the growing writer can append the missing byte(s)
+     * between an EOF hit on an earlier byte and this check, which would
+     * clear avio_feof() and mask the corruption that already happened to
+     * this specific read. */
+    if (mxf->growing && (eof_hit || avio_feof(pb)))
         return AVERROR_EOF;
 
     return 0;
@@ -791,15 +811,15 @@ static int mxf_decrypt_triplet(AVFormatContext *s, AVPacket *pkt, KLVPacket *klv
         av_aes_init(mxf->aesc, s->key, 128, 1);
     }
     // crypto context
-    size = klv_decode_ber_length(pb, NULL);
+    size = klv_decode_ber_length(pb, NULL, NULL);
     if (size < 0)
         return size;
     avio_skip(pb, size);
     // plaintext offset
-    klv_decode_ber_length(pb ,NULL);
+    klv_decode_ber_length(pb, NULL, NULL);
     plaintext_size = avio_rb64(pb);
     // source klv key
-    klv_decode_ber_length(pb, NULL);
+    klv_decode_ber_length(pb, NULL, NULL);
     avio_read(pb, klv->key, 16);
     if (!IS_KLV_KEY(klv, mxf_essence_element_key))
         return AVERROR_INVALIDDATA;
@@ -809,12 +829,12 @@ static int mxf_decrypt_triplet(AVFormatContext *s, AVPacket *pkt, KLVPacket *klv
     if (index < 0)
         return AVERROR_INVALIDDATA;
     // source size
-    klv_decode_ber_length(pb, NULL);
+    klv_decode_ber_length(pb, NULL, NULL);
     orig_size = avio_rb64(pb);
     if (orig_size < plaintext_size)
         return AVERROR_INVALIDDATA;
     // enc. code
-    size = klv_decode_ber_length(pb, NULL);
+    size = klv_decode_ber_length(pb, NULL, NULL);
     if (size < 32 || size - 32 < orig_size || (int)orig_size != orig_size)
         return AVERROR_INVALIDDATA;
     avio_read(pb, ivec, 16);
