@@ -610,25 +610,18 @@ static int klv_read_packet(MXFContext *mxf, KLVPacket *klv, AVIOContext *pb)
         return AVERROR_INVALIDDATA;
     klv->next_klv = pos + length;
 
-    /* TEMP DIAGNOSTIC (RDC-15459): klv_decode_ber_length() and
-     * ffio_read_size() above build the KLV entirely out of avio_r8()-family
-     * reads, which return 0 on EOF instead of propagating an error - so a
-     * growing reader that catches up to the writer mid-KLV (e.g. between the
-     * 16-byte key and its BER length byte) can read a fake all-zero length
-     * and this function returns "success" with a bogus zero-length packet,
-     * while avio_feof(pb) is actually true. mxf_read_packet()'s growing
-     * retry loop only checks avio_feof() on the error path (ret < 0), so this
-     * never gets treated as "wait and retry" - it desyncs, and the *next*
-     * read - now looking for a KLV key at the wrong offset - lands on
-     * unrelated bytes and fails with a real, un-retryable Invalid data
-     * error moments later. This is purely observational: it does not change
-     * behavior, just reports every time this exact condition occurs. */
+    /* RDC-15459: klv_decode_ber_length() and ffio_read_size() above build
+     * the KLV entirely out of avio_r8()-family reads, which return 0 on EOF
+     * instead of propagating an error. A growing reader that catches up to
+     * the writer mid-KLV (e.g. between the 16-byte key and its BER length
+     * byte) can read a fake all-zero length here, so treat a feof seen at
+     * this point as a real error - mxf_read_packet()'s growing retry loop
+     * already knows how to wait and retry on avio_feof(), for every earlier
+     * read in this function. Without this, the false "success" desyncs the
+     * reader: the next read looks for a KLV key at the wrong offset and
+     * fails with an un-retryable Invalid data error moments later. */
     if (mxf->growing && avio_feof(pb))
-        av_log(mxf->fc, AV_LOG_WARNING,
-               "growing MXF DIAG: klv_read_packet returning success with "
-               "avio_feof set - offset=%"PRId64" llen=%d length=%"PRId64
-               " next_klv=%"PRId64"\n",
-               klv->offset, llen, klv->length, klv->next_klv);
+        return AVERROR_EOF;
 
     return 0;
 }
