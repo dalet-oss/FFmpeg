@@ -34,7 +34,7 @@
 
 static const struct codec_string {
     enum AVCodecID id;
-    char str[8];
+    char str[16];
 } codecs[] = {
     { AV_CODEC_ID_VP8, "vp8" },
     { AV_CODEC_ID_VP9, "vp9" },
@@ -43,6 +43,8 @@ static const struct codec_string {
     { AV_CODEC_ID_FLAC, "flac" },
     // WebVTT in ISO BMFF, as defined by ISO/IEC 14496-30
     { AV_CODEC_ID_WEBVTT, "wvtt" },
+    // TTML in ISO BMFF (stpp), IMSC1 text profile, as defined by ISO/IEC 14496-30
+    { AV_CODEC_ID_TTML, "stpp.ttml.im1t" },
     { AV_CODEC_ID_NONE }
 };
 
