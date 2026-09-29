@@ -10074,6 +10074,16 @@ static void mov_free_encryption_index(MOVEncryptionIndex **index) {
     av_freep(index);
 }
 
+static void mov_wvtt_clear_cues(MOVStreamContext *sc)
+{
+    for (int i = 0; i < sc->nb_wvtt_cues; i++) {
+        av_freep(&sc->wvtt_cues[i].id);
+        av_freep(&sc->wvtt_cues[i].settings);
+        av_freep(&sc->wvtt_cues[i].payload);
+    }
+    sc->nb_wvtt_cues = 0;
+}
+
 static void mov_free_stream_context(AVFormatContext *s, AVStream *st)
 {
     MOVStreamContext *sc = st->priv_data;
@@ -10134,6 +10144,10 @@ static void mov_free_stream_context(AVFormatContext *s, AVStream *st)
         ff_iamf_read_deinit(sc->iamf);
 #endif
     av_freep(&sc->iamf);
+
+    mov_wvtt_clear_cues(sc);
+    av_freep(&sc->wvtt_cues);
+    sc->wvtt_cues_size = 0;
 }
 
 static int mov_read_close(AVFormatContext *s)
@@ -11326,6 +11340,234 @@ static int get_eia608_packet(AVIOContext *pb, AVPacket *pkt, int src_size)
     return ret;
 }
 
+/* Parse the hh:mm:ss.ttt timestamp of a 'ctim' box into milliseconds. */
+static int mov_wvtt_parse_ctim(const uint8_t *buf, int size, int64_t *ms)
+{
+    char str[32];
+    int h, m, s, t;
+
+    if (size <= 0 || size >= sizeof(str))
+        return AVERROR_INVALIDDATA;
+    memcpy(str, buf, size);
+    str[size] = 0;
+    if (sscanf(str, "%d:%d:%d.%d", &h, &m, &s, &t) != 4) {
+        h = 0;
+        if (sscanf(str, "%d:%d.%d", &m, &s, &t) != 3)
+            return AVERROR_INVALIDDATA;
+    }
+    *ms = ((h * 60LL + m) * 60 + s) * 1000 + t;
+    return 0;
+}
+
+static int mov_wvtt_dup_box(uint8_t **dst, int *dst_size,
+                            const uint8_t *src, int size)
+{
+    av_freep(dst);
+    *dst_size = 0;
+    if (!size)
+        return 0;
+    *dst = av_memdup(src, size);
+    if (!*dst)
+        return AVERROR(ENOMEM);
+    *dst_size = size;
+    return 0;
+}
+
+/* Emit the cues that are closed and cannot be preceded by a cue still open,
+ * so that pts never goes backwards. With all set, close every cue first. */
+static int mov_wvtt_flush_cues(AVFormatContext *s, AVStream *st, int all,
+                               int *nb_buffered)
+{
+    MOVStreamContext *sc = st->priv_data;
+    int ret = 0;
+
+    if (all)
+        for (int i = 0; i < sc->nb_wvtt_cues; i++)
+            sc->wvtt_cues[i].closed = 1;
+
+    while (sc->nb_wvtt_cues) {
+        MOVWVTTCue *cue = &sc->wvtt_cues[0];
+        AVPacket *pkt;
+        int first = 0;
+
+        for (int i = 1; i < sc->nb_wvtt_cues; i++)
+            if (sc->wvtt_cues[i].start < sc->wvtt_cues[first].start)
+                first = i;
+        cue = &sc->wvtt_cues[first];
+        if (!cue->closed)
+            break;
+
+        if (!(pkt = av_packet_alloc())) {
+            ret = AVERROR(ENOMEM);
+            break;
+        }
+        if ((ret = av_new_packet(pkt, cue->payload_size)) >= 0) {
+            uint8_t *sd;
+
+            if (cue->payload_size)
+                memcpy(pkt->data, cue->payload, cue->payload_size);
+            pkt->stream_index = sc->ffindex;
+            pkt->pts = pkt->dts = cue->start;
+            pkt->duration = FFMAX(cue->end - cue->start, 0);
+            pkt->flags |= AV_PKT_FLAG_KEY;
+            pkt->pos = cue->pos;
+
+            if (cue->id_size) {
+                sd = av_packet_new_side_data(pkt, AV_PKT_DATA_WEBVTT_IDENTIFIER,
+                                             cue->id_size);
+                if (sd)
+                    memcpy(sd, cue->id, cue->id_size);
+                else
+                    ret = AVERROR(ENOMEM);
+            }
+            if (ret >= 0 && cue->settings_size) {
+                sd = av_packet_new_side_data(pkt, AV_PKT_DATA_WEBVTT_SETTINGS,
+                                             cue->settings_size);
+                if (sd)
+                    memcpy(sd, cue->settings, cue->settings_size);
+                else
+                    ret = AVERROR(ENOMEM);
+            }
+            if (ret >= 0)
+                ret = ff_buffer_packet(s, pkt);
+        }
+        av_packet_free(&pkt);
+        if (ret < 0)
+            break;
+        (*nb_buffered)++;
+
+        av_freep(&cue->id);
+        av_freep(&cue->settings);
+        av_freep(&cue->payload);
+        memmove(cue, cue + 1, (sc->nb_wvtt_cues - first - 1) * sizeof(*cue));
+        sc->nb_wvtt_cues--;
+    }
+    return ret;
+}
+
+/* Parse one wvtt sample (14496-30) and update the list of active cues. Cues
+ * are keyed on their identifier, settings, text and start, and a cue that is
+ * not in the next sample has ended. 'vtte' and 'vtta' boxes carry no cue. */
+static int mov_wvtt_parse_sample(AVFormatContext *s, AVStream *st,
+                                 const uint8_t *buf, int size, int64_t pts,
+                                 int64_t end, int64_t pos, int *nb_buffered)
+{
+    MOVStreamContext *sc = st->priv_data;
+    const AVRational ms_tb = { 1, 1000 };
+    int ret = 0;
+
+    for (int i = 0; i < sc->nb_wvtt_cues; i++)
+        sc->wvtt_cues[i].seen = 0;
+
+    while (size >= 8) {
+        uint32_t box_size = AV_RB32(buf);
+        uint32_t box_tag  = AV_RL32(buf + 4);
+        const uint8_t *cbuf;
+        int csize;
+        MOVWVTTCue cue = { 0 };
+        int have_ctim = 0, have_payl = 0;
+
+        if (box_size < 8 || box_size > size) {
+            av_log(s, AV_LOG_WARNING, "Invalid box size in wvtt sample\n");
+            break;
+        }
+        cbuf = buf + 8;
+        csize = box_size - 8;
+        buf  += box_size;
+        size -= box_size;
+
+        if (box_tag != MKTAG('v','t','t','c'))
+            continue;
+
+        cue.start = pts;
+        cue.pos   = pos;
+        while (csize >= 8) {
+            uint32_t sub_size = AV_RB32(cbuf);
+            uint32_t sub_tag  = AV_RL32(cbuf + 4);
+            const uint8_t *data = cbuf + 8;
+            int data_size;
+
+            if (sub_size < 8 || sub_size > csize) {
+                av_log(s, AV_LOG_WARNING, "Invalid box size in wvtt cue\n");
+                break;
+            }
+            data_size = sub_size - 8;
+            cbuf  += sub_size;
+            csize -= sub_size;
+
+            if (sub_tag == MKTAG('i','d','e','n')) {
+                ret = mov_wvtt_dup_box(&cue.id, &cue.id_size, data, data_size);
+            } else if (sub_tag == MKTAG('s','t','t','g')) {
+                ret = mov_wvtt_dup_box(&cue.settings, &cue.settings_size, data, data_size);
+            } else if (sub_tag == MKTAG('p','a','y','l')) {
+                ret = mov_wvtt_dup_box(&cue.payload, &cue.payload_size, data, data_size);
+                have_payl = 1;
+            } else if (sub_tag == MKTAG('c','t','i','m')) {
+                int64_t ms;
+                if (mov_wvtt_parse_ctim(data, data_size, &ms) >= 0) {
+                    cue.start = av_rescale_q(ms, ms_tb, st->time_base);
+                    have_ctim = 1;
+                }
+            }
+            if (ret < 0)
+                break;
+        }
+        if (ret >= 0 && !have_payl)
+            av_log(s, AV_LOG_WARNING, "wvtt cue without payload\n");
+        cue.start_ms = have_ctim ? av_rescale_q(cue.start, st->time_base, ms_tb)
+                                 : av_rescale_q(pts, st->time_base, ms_tb);
+        cue.end = end;
+
+        if (ret >= 0) {
+            int found = 0;
+
+            for (int i = 0; i < sc->nb_wvtt_cues; i++) {
+                MOVWVTTCue *c = &sc->wvtt_cues[i];
+                if (c->closed || c->seen || c->start_ms != cue.start_ms ||
+                    c->id_size != cue.id_size ||
+                    c->settings_size != cue.settings_size ||
+                    c->payload_size != cue.payload_size ||
+                    (cue.id_size && memcmp(c->id, cue.id, cue.id_size)) ||
+                    (cue.settings_size && memcmp(c->settings, cue.settings, cue.settings_size)) ||
+                    (cue.payload_size && memcmp(c->payload, cue.payload, cue.payload_size)))
+                    continue;
+                c->seen = 1;
+                c->end  = FFMAX(c->end, end);
+                found = 1;
+                break;
+            }
+            if (!found) {
+                cue.seen = 1;
+                void *tmp = av_fast_realloc(sc->wvtt_cues, &sc->wvtt_cues_size,
+                                            (sc->nb_wvtt_cues + 1) * sizeof(*sc->wvtt_cues));
+                if (!tmp) {
+                    ret = AVERROR(ENOMEM);
+                } else {
+                    sc->wvtt_cues = tmp;
+                    sc->wvtt_cues[sc->nb_wvtt_cues++] = cue;
+                }
+            }
+            if (found || ret < 0) {
+                av_freep(&cue.id);
+                av_freep(&cue.settings);
+                av_freep(&cue.payload);
+            }
+        } else {
+            av_freep(&cue.id);
+            av_freep(&cue.settings);
+            av_freep(&cue.payload);
+        }
+        if (ret < 0)
+            return ret;
+    }
+
+    for (int i = 0; i < sc->nb_wvtt_cues; i++)
+        if (!sc->wvtt_cues[i].seen)
+            sc->wvtt_cues[i].closed = 1;
+
+    return mov_wvtt_flush_cues(s, st, 0, nb_buffered);
+}
+
 static int mov_finalize_packet(AVFormatContext *s, AVStream *st, AVIndexEntry *sample,
                                 int64_t current_index, AVPacket *pkt)
 {
@@ -11438,8 +11680,16 @@ static int mov_read_packet(AVFormatContext *s, AVPacket *pkt)
     }
     sample = mov_find_next_sample(s, &st);
     if (!sample || (mov->next_root_atom && sample->pos > mov->next_root_atom)) {
-        if (!mov->next_root_atom)
-            return AVERROR_EOF;
+        if (!mov->next_root_atom) {
+            int nb_buffered = 0;
+            for (i = 0; i < s->nb_streams; i++) {
+                MOVStreamContext *msc = s->streams[i]->priv_data;
+                if (msc && msc->nb_wvtt_cues &&
+                    (ret = mov_wvtt_flush_cues(s, s->streams[i], 1, &nb_buffered)) < 0)
+                    return ret;
+            }
+            return nb_buffered ? FFERROR_REDO : AVERROR_EOF;
+        }
         if ((ret = mov_switch_root(s, mov->next_root_atom, -1)) < 0)
             return ret;
         goto retry;
@@ -11474,6 +11724,36 @@ static int mov_read_packet(AVFormatContext *s, AVPacket *pkt)
 
         if ((st->codecpar->codec_id == AV_CODEC_ID_EIA_608 || st->codecpar->codec_id == AV_CODEC_ID_EIA_708) && sample->size > 8)
             ret = get_eia608_packet(sc->pb, pkt, sample->size);
+        else if (st->codecpar->codec_id == AV_CODEC_ID_WEBVTT &&
+                 st->codecpar->codec_tag == MOV_MP4_WEBVTT_TAG) {
+            uint8_t *buf;
+            int64_t pts, end;
+            int nb_buffered = 0;
+
+            if (sample->size < 0 || !(buf = av_malloc(sample->size + 1)))
+                return AVERROR(ENOMEM);
+            ret = avio_read(sc->pb, buf, sample->size);
+            if (ret != sample->size) {
+                av_free(buf);
+                if (ret >= 0)
+                    ret = AVERROR_INVALIDDATA;
+                if (should_retry(sc->pb, ret))
+                    mov_current_sample_dec(sc);
+                return ret;
+            }
+            av_packet_unref(pkt);
+            ret = mov_finalize_packet(s, st, sample, current_index, pkt);
+            pts = pkt->pts;
+            end = pts + pkt->duration;
+            av_packet_unref(pkt);
+            if (ret >= 0)
+                ret = mov_wvtt_parse_sample(s, st, buf, sample->size, pts, end,
+                                            sample->pos, &nb_buffered);
+            av_free(buf);
+            if (ret < 0)
+                return ret;
+            return FFERROR_REDO;
+        }
 #if CONFIG_IAMFDEC
         else if (sc->iamf) {
             int64_t pts, dts, pos, duration;
@@ -11739,6 +12019,11 @@ static int mov_read_seek(AVFormatContext *s, int stream_index, int64_t sample_ti
     sample = mov_seek_stream(s, st, sample_time, flags);
     if (sample < 0)
         return sample;
+
+    for (i = 0; i < s->nb_streams; i++) {
+        MOVStreamContext *sc = s->streams[i]->priv_data;
+        mov_wvtt_clear_cues(sc);
+    }
 
     if (mc->seek_individually) {
         /* adjust seek timestamp to found sample timestamp */
