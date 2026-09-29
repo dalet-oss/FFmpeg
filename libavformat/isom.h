@@ -299,6 +299,13 @@ typedef struct MOVStreamContext {
     MOVWVTTCue *wvtt_cues;  ///< wvtt cues seen in a sample and not yet emitted
     int nb_wvtt_cues;
     unsigned int wvtt_cues_size;
+
+    int ttml_paragraphs;    ///< stpp samples are demuxed as one packet per <p>
+    AVPacket **ttml_held;   ///< paragraphs ending at the end of a sample, held back to merge them with their continuation
+    int nb_ttml_held;
+    unsigned int ttml_held_size;
+    int64_t ttml_last_pts;  ///< pts of the last paragraph emitted, in stream time base
+    int ttml_head_logged;   ///< a later sample with a different <head> was reported
 } MOVStreamContext;
 
 typedef struct HEIFItemRef {
