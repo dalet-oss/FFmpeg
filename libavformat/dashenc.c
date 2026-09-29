@@ -59,6 +59,7 @@ typedef enum {
     SEGMENT_TYPE_MP4,
     SEGMENT_TYPE_WEBM,
     SEGMENT_TYPE_WEBVTT,
+    SEGMENT_TYPE_TTML,
     SEGMENT_TYPE_NB
 } SegmentType;
 
@@ -267,6 +268,7 @@ static const char *get_format_str(SegmentType segment_type)
     case SEGMENT_TYPE_MP4:    return "mp4";
     case SEGMENT_TYPE_WEBM:   return "webm";
     case SEGMENT_TYPE_WEBVTT: return "webvtt";
+    case SEGMENT_TYPE_TTML:   return "ttml";
     }
     return NULL;
 }
@@ -278,6 +280,7 @@ static const char *get_extension_str(SegmentType type, int single_file)
     case SEGMENT_TYPE_MP4:    return single_file ? "mp4" : "m4s";
     case SEGMENT_TYPE_WEBM:   return "webm";
     case SEGMENT_TYPE_WEBVTT: return "vtt";
+    case SEGMENT_TYPE_TTML:   return "ttml";
     default: return NULL;
     }
 }
@@ -295,9 +298,12 @@ static inline SegmentType select_segment_type(SegmentType segment_type, enum AVC
     /* WebVTT is carried either as the single side loaded file a whole Period is
      * allowed to have, or, when the output is segmented, as an ISO/IEC 14496-30
      * text track in the regular mp4 segments. Segmented plain WebVTT files are
-     * not a DASH segment format. */
+     * not a DASH segment format. TTML follows the same rule: one side loaded
+     * document, or stpp samples in the mp4 segments. */
     if (codec_id == AV_CODEC_ID_WEBVTT)
         return single_file ? SEGMENT_TYPE_WEBVTT : SEGMENT_TYPE_MP4;
+    if (codec_id == AV_CODEC_ID_TTML)
+        return single_file ? SEGMENT_TYPE_TTML : SEGMENT_TYPE_MP4;
 
     if (segment_type == SEGMENT_TYPE_AUTO) {
         if (codec_id == AV_CODEC_ID_OPUS || codec_id == AV_CODEC_ID_VORBIS ||
@@ -603,6 +609,9 @@ static int output_segment_list(OutputStream *os, AVIOContext *out, AVFormatConte
             avio_printf(out, "\t\t\t\t\t</SegmentTimeline>\n");
         }
         avio_printf(out, "\t\t\t\t</SegmentTemplate>\n");
+    } else if (c->single_file && os->segment_type == SEGMENT_TYPE_TTML) {
+        /* a side loaded TTML document is one resource, it has no byte ranges */
+        avio_printf(out, "\t\t\t\t<BaseURL>%s</BaseURL>\n", os->initfile);
     } else if (c->single_file) {
         int64_t seglist_duration = s->streams[representation_id]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE ?
                                     os->last_duration : FFMIN(os->seg_duration, os->last_duration);
@@ -813,11 +822,14 @@ static int write_adaptation_set(AVFormatContext *s, AVIOContext *out, int as_ind
             avio_printf(out, "\t\t\t\t<AudioChannelConfiguration schemeIdUri=\"urn:mpeg:dash:23003:3:audio_channel_configuration:2011\" value=\"%d\" />\n",
                 s->streams[i]->codecpar->ch_layout.nb_channels);
         } else { // AVMEDIA_TYPE_SUBTITLE
-            /* A side loaded WebVTT file is signalled with its own mime type and
-             * carries no @codecs, an ISO BMFF text track is signalled like any
-             * other mp4 representation. */
+            /* A side loaded WebVTT or TTML file is signalled with its own mime
+             * type and carries no @codecs, an ISO BMFF text track is signalled
+             * like any other mp4 representation. */
             if (os->segment_type == SEGMENT_TYPE_WEBVTT)
                 avio_printf(out, "\t\t\t<Representation id=\"%d\" mimeType=\"text/vtt\"%s>\n",
+                    i, bandwidth_str);
+            else if (os->segment_type == SEGMENT_TYPE_TTML)
+                avio_printf(out, "\t\t\t<Representation id=\"%d\" mimeType=\"application/ttml+xml\"%s>\n",
                     i, bandwidth_str);
             else
                 avio_printf(out, "\t\t\t<Representation id=\"%d\" mimeType=\"application/%s\" codecs=\"%s\"%s>\n",
@@ -1659,7 +1671,8 @@ static int dash_init(AVFormatContext *s)
             av_dict_set_int(&opts, "dash_track_number", i + 1, 0);
             av_dict_set_int(&opts, "live", 1, 0);
         }
-        // SEGMENT_TYPE_WEBVTT: ff_webvtt_muxer has no format-specific options
+        // SEGMENT_TYPE_WEBVTT, SEGMENT_TYPE_TTML: the webvtt and ttml muxers have
+        // no format-specific options we set
         ret = avformat_init_output(ctx, &opts);
         av_dict_free(&opts);
         if (ret < 0)
@@ -1750,10 +1763,11 @@ static int dash_write_header(AVFormatContext *s)
             return ret;
 
         // Flush init segment
-        // Only for WebM/WebVTT, since for mp4 delay_moov is set and
+        // Only for WebM/WebVTT/TTML, since for mp4 delay_moov is set and
         // the init segment is thus flushed after the first packets.
         if ((os->segment_type == SEGMENT_TYPE_WEBM ||
-             os->segment_type == SEGMENT_TYPE_WEBVTT) &&
+             os->segment_type == SEGMENT_TYPE_WEBVTT ||
+             os->segment_type == SEGMENT_TYPE_TTML) &&
             (ret = flush_init_segment(s, os)) < 0)
             return ret;
     }
