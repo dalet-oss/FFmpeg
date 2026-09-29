@@ -1,10 +1,46 @@
 cbd2c7ff864a663b0d893deac5a0caec *tests/data/fate/mov-mp4-ttml-stpp.mp4
 8547 tests/data/fate/mov-mp4-ttml-stpp.mp4
-#extradata 0:       48, 0x62100c0d
+#extradata 0:      458, 0xbffe97bf
 #tb 0: 1/1000
 #media_type 0: subtitle
 #codec_id 0: ttml
-0,          0,          0,    68500,     7866, 0x456c36b7
+0,          0,          0,        0,       87, 0x4c5b1ee5
+0,       1500,       1500,     3000,      338, 0xcae07648
+0,       4500,       4500,        0,       36, 0xed2b0cbd
+0,       4501,       4501,     2999,      114, 0x341628d8
+0,       7501,       7501,     3999,      250, 0xa9205bee
+0,      11501,      11501,     2999,      197, 0x58304741
+0,      14501,      14501,     2999,      210, 0x65354a19
+0,      17501,      17501,     2999,      283, 0xa0316513
+0,      20501,      20501,      999,       75, 0xfce01aa4
+0,      21501,      21501,      999,       76, 0x0f6d1b2b
+0,      22501,      22501,     1999,      136, 0xfb9130d5
+0,      22502,      22502,     1999,       93, 0x22b621d2
+0,      22503,      22503,     1999,       93, 0x27f621f8
+0,      24501,      24501,     1999,       93, 0x1e0d216d
+0,      24502,      24502,     1999,      138, 0x6f2a3181
+0,      24503,      24503,     1999,       96, 0x8a8d22af
+0,      26501,      26501,     1999,       94, 0x40d121e0
+0,      26502,      26502,     1999,       97, 0xa8bb22fc
+0,      26503,      26503,     1999,       97, 0xae932322
+0,      28501,      28501,     2999,       81, 0xa9181d6d
+0,      31501,      31501,    18999,       40, 0x26250e5e
+0,      33500,      33500,     2000,       64, 0xe746170f
+0,      35501,      35501,     1999,       61, 0xa21c15dc
+0,      36501,      36501,    13999,       74, 0xe66c1ab9
+0,      40501,      40501,     4999,       60, 0x8a901571
+0,      45501,      45501,     4999,       74, 0xdda61aa2
+0,      50501,      50501,     1999,       45, 0x60ef0f0d
+0,      50502,      50502,     1999,       36, 0xec660c88
+0,      52501,      52501,     1999,      105, 0xb3682596
+0,      54501,      54501,     5999,      287, 0x99ad67c8
+0,      54502,      54502,     1999,      172, 0xd4e43ad0
+0,      56501,      56501,     1999,      202, 0x73274476
+0,      58501,      58501,     1999,      294, 0x54da643d
+0,      60501,      60501,     1999,      121, 0x68a12b81
+0,      62501,      62501,     1999,      130, 0xf42a2e78
+0,      64501,      64501,     1999,      110, 0x9ebb27af
+0,      66501,      66501,     1999,      110, 0xafd42830
 {
     "packets": [
         {
@@ -14,9 +50,473 @@ cbd2c7ff864a663b0d893deac5a0caec *tests/data/fate/mov-mp4-ttml-stpp.mp4
             "pts_time": "0.000000",
             "dts": 0,
             "dts_time": "0.000000",
-            "duration": 68500,
-            "duration_time": "68.500000",
-            "size": "7866",
+            "size": "87",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 1500,
+            "pts_time": "1.500000",
+            "dts": 1500,
+            "dts_time": "1.500000",
+            "duration": 3000,
+            "duration_time": "3.000000",
+            "size": "338",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 4500,
+            "pts_time": "4.500000",
+            "dts": 4500,
+            "dts_time": "4.500000",
+            "size": "36",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 4501,
+            "pts_time": "4.501000",
+            "dts": 4501,
+            "dts_time": "4.501000",
+            "duration": 2999,
+            "duration_time": "2.999000",
+            "size": "114",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 7501,
+            "pts_time": "7.501000",
+            "dts": 7501,
+            "dts_time": "7.501000",
+            "duration": 3999,
+            "duration_time": "3.999000",
+            "size": "250",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 11501,
+            "pts_time": "11.501000",
+            "dts": 11501,
+            "dts_time": "11.501000",
+            "duration": 2999,
+            "duration_time": "2.999000",
+            "size": "197",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 14501,
+            "pts_time": "14.501000",
+            "dts": 14501,
+            "dts_time": "14.501000",
+            "duration": 2999,
+            "duration_time": "2.999000",
+            "size": "210",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 17501,
+            "pts_time": "17.501000",
+            "dts": 17501,
+            "dts_time": "17.501000",
+            "duration": 2999,
+            "duration_time": "2.999000",
+            "size": "283",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 20501,
+            "pts_time": "20.501000",
+            "dts": 20501,
+            "dts_time": "20.501000",
+            "duration": 999,
+            "duration_time": "0.999000",
+            "size": "75",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 21501,
+            "pts_time": "21.501000",
+            "dts": 21501,
+            "dts_time": "21.501000",
+            "duration": 999,
+            "duration_time": "0.999000",
+            "size": "76",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 22501,
+            "pts_time": "22.501000",
+            "dts": 22501,
+            "dts_time": "22.501000",
+            "duration": 1999,
+            "duration_time": "1.999000",
+            "size": "136",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 22502,
+            "pts_time": "22.502000",
+            "dts": 22502,
+            "dts_time": "22.502000",
+            "duration": 1999,
+            "duration_time": "1.999000",
+            "size": "93",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 22503,
+            "pts_time": "22.503000",
+            "dts": 22503,
+            "dts_time": "22.503000",
+            "duration": 1999,
+            "duration_time": "1.999000",
+            "size": "93",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 24501,
+            "pts_time": "24.501000",
+            "dts": 24501,
+            "dts_time": "24.501000",
+            "duration": 1999,
+            "duration_time": "1.999000",
+            "size": "93",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 24502,
+            "pts_time": "24.502000",
+            "dts": 24502,
+            "dts_time": "24.502000",
+            "duration": 1999,
+            "duration_time": "1.999000",
+            "size": "138",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 24503,
+            "pts_time": "24.503000",
+            "dts": 24503,
+            "dts_time": "24.503000",
+            "duration": 1999,
+            "duration_time": "1.999000",
+            "size": "96",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 26501,
+            "pts_time": "26.501000",
+            "dts": 26501,
+            "dts_time": "26.501000",
+            "duration": 1999,
+            "duration_time": "1.999000",
+            "size": "94",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 26502,
+            "pts_time": "26.502000",
+            "dts": 26502,
+            "dts_time": "26.502000",
+            "duration": 1999,
+            "duration_time": "1.999000",
+            "size": "97",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 26503,
+            "pts_time": "26.503000",
+            "dts": 26503,
+            "dts_time": "26.503000",
+            "duration": 1999,
+            "duration_time": "1.999000",
+            "size": "97",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 28501,
+            "pts_time": "28.501000",
+            "dts": 28501,
+            "dts_time": "28.501000",
+            "duration": 2999,
+            "duration_time": "2.999000",
+            "size": "81",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 31501,
+            "pts_time": "31.501000",
+            "dts": 31501,
+            "dts_time": "31.501000",
+            "duration": 18999,
+            "duration_time": "18.999000",
+            "size": "40",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 33500,
+            "pts_time": "33.500000",
+            "dts": 33500,
+            "dts_time": "33.500000",
+            "duration": 2000,
+            "duration_time": "2.000000",
+            "size": "64",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 35501,
+            "pts_time": "35.501000",
+            "dts": 35501,
+            "dts_time": "35.501000",
+            "duration": 1999,
+            "duration_time": "1.999000",
+            "size": "61",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 36501,
+            "pts_time": "36.501000",
+            "dts": 36501,
+            "dts_time": "36.501000",
+            "duration": 13999,
+            "duration_time": "13.999000",
+            "size": "74",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 40501,
+            "pts_time": "40.501000",
+            "dts": 40501,
+            "dts_time": "40.501000",
+            "duration": 4999,
+            "duration_time": "4.999000",
+            "size": "60",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 45501,
+            "pts_time": "45.501000",
+            "dts": 45501,
+            "dts_time": "45.501000",
+            "duration": 4999,
+            "duration_time": "4.999000",
+            "size": "74",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 50501,
+            "pts_time": "50.501000",
+            "dts": 50501,
+            "dts_time": "50.501000",
+            "duration": 1999,
+            "duration_time": "1.999000",
+            "size": "45",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 50502,
+            "pts_time": "50.502000",
+            "dts": 50502,
+            "dts_time": "50.502000",
+            "duration": 1999,
+            "duration_time": "1.999000",
+            "size": "36",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 52501,
+            "pts_time": "52.501000",
+            "dts": 52501,
+            "dts_time": "52.501000",
+            "duration": 1999,
+            "duration_time": "1.999000",
+            "size": "105",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 54501,
+            "pts_time": "54.501000",
+            "dts": 54501,
+            "dts_time": "54.501000",
+            "duration": 5999,
+            "duration_time": "5.999000",
+            "size": "287",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 54502,
+            "pts_time": "54.502000",
+            "dts": 54502,
+            "dts_time": "54.502000",
+            "duration": 1999,
+            "duration_time": "1.999000",
+            "size": "172",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 56501,
+            "pts_time": "56.501000",
+            "dts": 56501,
+            "dts_time": "56.501000",
+            "duration": 1999,
+            "duration_time": "1.999000",
+            "size": "202",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 58501,
+            "pts_time": "58.501000",
+            "dts": 58501,
+            "dts_time": "58.501000",
+            "duration": 1999,
+            "duration_time": "1.999000",
+            "size": "294",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 60501,
+            "pts_time": "60.501000",
+            "dts": 60501,
+            "dts_time": "60.501000",
+            "duration": 1999,
+            "duration_time": "1.999000",
+            "size": "121",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 62501,
+            "pts_time": "62.501000",
+            "dts": 62501,
+            "dts_time": "62.501000",
+            "duration": 1999,
+            "duration_time": "1.999000",
+            "size": "130",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 64501,
+            "pts_time": "64.501000",
+            "dts": 64501,
+            "dts_time": "64.501000",
+            "duration": 1999,
+            "duration_time": "1.999000",
+            "size": "110",
+            "pos": "44",
+            "flags": "K__"
+        },
+        {
+            "codec_type": "subtitle",
+            "stream_index": 0,
+            "pts": 66501,
+            "pts_time": "66.501000",
+            "dts": 66501,
+            "dts_time": "66.501000",
+            "duration": 1999,
+            "duration_time": "1.999000",
+            "size": "110",
             "pos": "44",
             "flags": "K__"
         }
@@ -39,7 +539,7 @@ cbd2c7ff864a663b0d893deac5a0caec *tests/data/fate/mov-mp4-ttml-stpp.mp4
             "duration_ts": 68500,
             "duration": "68.500000",
             "nb_frames": "1",
-            "nb_read_packets": "1",
+            "nb_read_packets": "37",
             "tags": {
                 "language": "und",
                 "handler_name": "SubtitleHandler"
