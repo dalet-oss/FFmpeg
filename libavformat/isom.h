@@ -170,6 +170,17 @@ typedef struct MOVIndexRange {
     int64_t end;
 } MOVIndexRange;
 
+typedef struct MOVWVTTCue {
+    int64_t start;      ///< in stream time base
+    int64_t start_ms;   ///< start, in ms, used to match a cue between samples
+    int64_t end;
+    int64_t pos;
+    uint8_t *id, *settings, *payload;
+    int id_size, settings_size, payload_size;
+    int closed;         ///< absent from a later sample, ready to be emitted
+    int seen;           ///< present in the sample being parsed
+} MOVWVTTCue;
+
 typedef struct MOVStreamContext {
     AVIOContext *pb;
     int refcount;
@@ -284,6 +295,10 @@ typedef struct MOVStreamContext {
 
     struct IAMFDemuxContext *iamf;
     int iamf_stream_offset;
+
+    MOVWVTTCue *wvtt_cues;  ///< wvtt cues seen in a sample and not yet emitted
+    int nb_wvtt_cues;
+    unsigned int wvtt_cues_size;
 } MOVStreamContext;
 
 typedef struct HEIFItemRef {
