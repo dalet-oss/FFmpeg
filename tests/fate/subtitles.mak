@@ -157,6 +157,14 @@ fate-sub-dvb: CMD = framecrc -i $(TARGET_SAMPLES)/sub/dvbsubtest_filter.ts -map 
 FATE_SUBTITLES-$(call ALLYES, PIPE_PROTOCOL SRT_DEMUXER SUBRIP_DECODER TTML_ENCODER TTML_MUXER) += fate-sub-ttmlenc
 fate-sub-ttmlenc: CMD = fmtstdout ttml -i $(TARGET_SAMPLES)/sub/SubRip_capability_tester.srt
 
+# Input is the reference output of fate-sub-ttmlenc, so no sample is needed.
+FATE_SUBTITLES-$(call ALLYES, LIBXML2 TTML_DEMUXER TTML_MUXER) += fate-sub-ttml-copy
+fate-sub-ttml-copy: CMD = fmtstdout ttml -i $(SRC_PATH)/tests/ref/fate/sub-ttmlenc -c:s copy
+
+# A document whose elements have no namespace, as written by some SMPTE 2052 tools.
+FATE_SUBTITLES-$(call ALLYES, LIBXML2 TTML_DEMUXER TTML_MUXER) += fate-sub-ttml-nons
+fate-sub-ttml-nons: CMD = fmtstdout ttml -i $(SRC_PATH)/tests/ref/fate/sub-ttml-nons-input -c:s copy
+
 FATE_SUBTITLES-$(call ENCMUX, ASS, ASS) += $(FATE_SUBTITLES_ASS-yes)
 FATE_SUBTITLES += $(FATE_SUBTITLES-yes)
 FATE_SUBTITLES := $(if $(CONFIG_PIPE_PROTOCOL), $(FATE_SUBTITLES))

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<tt
+  xmlns="http://www.w3.org/ns/ttml"
+  xmlns:tts="http://www.w3.org/ns/ttml#styling"
+  xmlns:ttp="http://www.w3.org/ns/ttml#parameter"
+  ttp:frameRate="30"
+  ttp:frameRateMultiplier="1000 1001"
+  ttp:timeBase="media"
+  xml:lang="en">
+<head>
+    <styling>
+      <style tts:color="white" xml:id="basic"/>
+    </styling>
+    <layout>
+      <region tts:origin="10% 90%" tts:extent="80% 10%" xml:id="pop1"/>
+    </layout>
+  </head>
+  <body>
+    <div>
+      <p
+        begin="00:00:01.000"
+        end="00:00:02.500"><span style="basic" region="pop1">First<br/>line</span></p>
+      <p
+        begin="00:00:03.000"
+        end="00:00:04.000"><span style="basic" region="pop1"><span tts:color="red">Second</span></span></p>
+    </div>
+  </body>
+</tt>
