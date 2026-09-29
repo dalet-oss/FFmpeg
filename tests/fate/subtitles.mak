@@ -157,6 +157,9 @@ fate-sub-dvb: CMD = framecrc -i $(TARGET_SAMPLES)/sub/dvbsubtest_filter.ts -map 
 FATE_SUBTITLES-$(call ALLYES, PIPE_PROTOCOL SRT_DEMUXER SUBRIP_DECODER TTML_ENCODER TTML_MUXER) += fate-sub-ttmlenc
 fate-sub-ttmlenc: CMD = fmtstdout ttml -i $(TARGET_SAMPLES)/sub/SubRip_capability_tester.srt
 
+FATE_SUBTITLES_ASS-$(call ALLYES, LIBXML2 TTML_DEMUXER TTML_DECODER) += fate-sub-ttml
+fate-sub-ttml: CMD = fmtstdout ass -i $(SRC_PATH)/tests/ref/fate/sub-ttmlenc
+
 # Input is the reference output of fate-sub-ttmlenc, so no sample is needed.
 FATE_SUBTITLES-$(call ALLYES, LIBXML2 TTML_DEMUXER TTML_MUXER) += fate-sub-ttml-copy
 fate-sub-ttml-copy: CMD = fmtstdout ttml -i $(SRC_PATH)/tests/ref/fate/sub-ttmlenc -c:s copy
