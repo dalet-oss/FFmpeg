@@ -70,6 +70,10 @@
 #include "id3v1.h"
 #include "mov_chan.h"
 #include "replaygain.h"
+#include "ttmlenc.h"
+#if CONFIG_LIBXML2
+#include "ttml_parse.h"
+#endif
 
 #if CONFIG_ZLIB
 #include <zlib.h>
@@ -10074,6 +10078,13 @@ static void mov_free_encryption_index(MOVEncryptionIndex **index) {
     av_freep(index);
 }
 
+static void mov_ttml_clear_held(MOVStreamContext *sc)
+{
+    for (int i = 0; i < sc->nb_ttml_held; i++)
+        av_packet_free(&sc->ttml_held[i]);
+    sc->nb_ttml_held = 0;
+}
+
 static void mov_wvtt_clear_cues(MOVStreamContext *sc)
 {
     for (int i = 0; i < sc->nb_wvtt_cues; i++) {
@@ -10145,6 +10156,8 @@ static void mov_free_stream_context(AVFormatContext *s, AVStream *st)
 #endif
     av_freep(&sc->iamf);
 
+    mov_ttml_clear_held(sc);
+    av_freep(&sc->ttml_held);
     mov_wvtt_clear_cues(sc);
     av_freep(&sc->wvtt_cues);
     sc->wvtt_cues_size = 0;
@@ -10931,6 +10944,257 @@ static void fix_stream_ids(AVFormatContext *s)
     }
 }
 
+#if CONFIG_LIBXML2
+#define MOV_TTML_MAX_SAMPLE_SIZE (16 * 1024 * 1024)
+#define MOV_TTML_PROBE_SAMPLES   4
+
+typedef struct MOVTTMLParagraphs {
+    AVFormatContext *s;
+    AVStream *st;
+    int64_t sample_end;
+    int64_t pos;
+    AVPacket **pkts;
+    unsigned int nb_pkts;
+    unsigned int pkts_size;
+} MOVTTMLParagraphs;
+
+/* Whether the extradata built by ff_ttml_parse() carries a <head>. */
+static int mov_ttml_has_head(const AVCodecParameters *par)
+{
+    const uint8_t *ed = par->extradata;
+    int size = par->extradata_size, n;
+
+    if (size <= TTMLENC_EXTRADATA_SIGNATURE_SIZE)
+        return 0;
+    ed   += TTMLENC_EXTRADATA_SIGNATURE_SIZE;
+    size -= TTMLENC_EXTRADATA_SIGNATURE_SIZE;
+    n = av_strnlen(ed, size);
+    return n + 1 < size && ed[n + 1];
+}
+
+static int mov_ttml_add_paragraph(void *opaque, const char *text, int len,
+                                  int64_t begin, int64_t end, int64_t line)
+{
+    const AVRational ms_tb = { 1, 1000 };
+    MOVTTMLParagraphs *p = opaque;
+    AVPacket **pkts = av_fast_realloc(p->pkts, &p->pkts_size,
+                                      (p->nb_pkts + 1) * sizeof(*p->pkts));
+
+    if (!pkts)
+        return AVERROR(ENOMEM);
+    p->pkts = pkts;
+    AVPacket *pkt = av_packet_alloc();
+    int ret;
+
+    if (!pkt)
+        return AVERROR(ENOMEM);
+    if ((ret = av_new_packet(pkt, len)) < 0) {
+        av_packet_free(&pkt);
+        return ret;
+    }
+    memcpy(pkt->data, text, len);
+
+    /* Times in an stpp document are on the timeline of the track, the same
+     * as the sample times, and the sample only says when the document is
+     * shown (the same as the ttml muxer writes them). Only dfxp offsets them
+     * to the start of the sample. */
+    pkt->pts = pkt->dts = av_rescale_q(begin, ms_tb, p->st->time_base);
+    end = end == AV_NOPTS_VALUE ? p->sample_end :
+          av_rescale_q(end, ms_tb, p->st->time_base);
+    pkt->duration = FFMAX(end - pkt->pts, 0);
+    pkt->flags   |= AV_PKT_FLAG_KEY;
+    pkt->pos      = p->pos;
+    p->pkts[p->nb_pkts++] = pkt;
+    return 0;
+}
+
+static int mov_ttml_cmp_pts(const void *a, const void *b)
+{
+    const AVPacket *p1 = *(AVPacket * const *)a, *p2 = *(AVPacket * const *)b;
+    return FFDIFFSIGN(p1->pts, p2->pts);
+}
+
+/* A cue that crosses a fragment or segment boundary is written by the
+ * muxer as one paragraph per document, ending where the sample does, so hold
+ * those back to put the pieces together. */
+/* Emit the held paragraphs that cannot be continued any more, and the ones
+ * queued behind them so the pts stays monotonic. With all set, emit all. */
+static int mov_ttml_flush_held(AVFormatContext *s, MOVStreamContext *sc,
+                               int64_t sample_end, int all)
+{
+    int n = 0, ret = 0;
+
+    while (n < sc->nb_ttml_held) {
+        AVPacket *pkt = sc->ttml_held[n];
+
+        if (!all && pkt->pts + pkt->duration == sample_end)
+            break;
+        if ((ret = ff_buffer_packet(s, pkt)) < 0)
+            break;
+        av_packet_free(&sc->ttml_held[n++]);
+    }
+    memmove(sc->ttml_held, sc->ttml_held + n,
+            (sc->nb_ttml_held - n) * sizeof(*sc->ttml_held));
+    sc->nb_ttml_held -= n;
+    return ret;
+}
+
+/* Emit a paragraph packet for each <p> of a stpp sample. */
+static int mov_ttml_parse_sample(AVFormatContext *s, AVStream *st,
+                                 const uint8_t *buf, int size,
+                                 int64_t end, int64_t pos)
+{
+    MOVStreamContext *sc = st->priv_data;
+    MOVTTMLParagraphs p = { .s = s, .st = st, .sample_end = end, .pos = pos };
+    AVCodecParameters *par = avcodec_parameters_alloc();
+    int ret;
+
+    if (!par)
+        return AVERROR(ENOMEM);
+    ret = ff_ttml_parse(s, buf, size, par, NULL, mov_ttml_add_paragraph, &p);
+    if (ret >= 0 && !sc->ttml_head_logged && mov_ttml_has_head(par) &&
+        (par->extradata_size != st->codecpar->extradata_size ||
+         memcmp(par->extradata, st->codecpar->extradata, par->extradata_size))) {
+        av_log(s, AV_LOG_VERBOSE, "Stream %d: the header of the TTML document "
+               "in the sample at %"PRId64" differs from the first one, "
+               "ignoring it\n", sc->ffindex, pos);
+        sc->ttml_head_logged = 1;
+    }
+    avcodec_parameters_free(&par);
+
+    /* a broken document is reported by the parser, skip it */
+    if (ret == AVERROR_INVALIDDATA)
+        ret = 0;
+
+    if (ret >= 0 && p.nb_pkts) {
+        qsort(p.pkts, p.nb_pkts, sizeof(*p.pkts), mov_ttml_cmp_pts);
+        for (unsigned i = 0; i < p.nb_pkts; i++) {
+            AVPacket *pkt = p.pkts[i];
+            AVPacket **held;
+            int j;
+
+            /* keep the pts monotonic across the samples */
+            if (sc->ttml_last_pts != AV_NOPTS_VALUE && pkt->pts < sc->ttml_last_pts) {
+                pkt->duration = FFMAX(pkt->duration - (sc->ttml_last_pts - pkt->pts), 0);
+                pkt->pts = pkt->dts = sc->ttml_last_pts;
+            }
+            sc->ttml_last_pts = pkt->pts;
+            pkt->stream_index = sc->ffindex;
+            if (ret < 0)
+                continue;
+
+            for (j = 0; j < sc->nb_ttml_held; j++) {
+                AVPacket *h = sc->ttml_held[j];
+                if (h->pos != pkt->pos && h->pts + h->duration == pkt->pts &&
+                    h->size == pkt->size && !memcmp(h->data, pkt->data, pkt->size)) {
+                    h->duration += pkt->duration;
+                    break;
+                }
+            }
+            if (j < sc->nb_ttml_held)
+                continue;
+
+            if (!(held = av_fast_realloc(sc->ttml_held, &sc->ttml_held_size,
+                                         (sc->nb_ttml_held + 1) * sizeof(*held))) ||
+                !(held[sc->nb_ttml_held] = av_packet_alloc())) {
+                ret = AVERROR(ENOMEM);
+                continue;
+            }
+            sc->ttml_held = held;
+            av_packet_move_ref(held[sc->nb_ttml_held++], pkt);
+        }
+        if (ret >= 0)
+            ret = mov_ttml_flush_held(s, sc, end, 0);
+    }
+    for (unsigned i = 0; i < p.nb_pkts; i++)
+        av_packet_free(&p.pkts[i]);
+    av_free(p.pkts);
+    return ret;
+}
+
+/* stpp samples are whole documents, so a stream copied to the ttml muxer
+ * would be refused the second one. Demux them as paragraphs instead, which
+ * needs the extradata the ttml muxer expects: build it from the first
+ * documents now, rather than at the first packet, when the muxer has already
+ * been given the parameters. */
+static int mov_ttml_probe_stream(AVFormatContext *s, AVStream *st)
+{
+    MOVStreamContext *sc = st->priv_data;
+    FFStream *sti = ffstream(st);
+    AVCodecParameters *first = NULL, *par = NULL;
+    AVDictionary *md = NULL;
+    int64_t saved = -1;
+    int have_head = 0, ret = 0;
+
+    /* fall back to the default namespaces if there is nothing to read */
+    ret = ff_alloc_extradata(st->codecpar, TTMLENC_EXTRADATA_SIGNATURE_SIZE);
+    if (ret < 0)
+        return ret;
+    memcpy(st->codecpar->extradata, TTMLENC_EXTRADATA_SIGNATURE,
+           TTMLENC_EXTRADATA_SIGNATURE_SIZE);
+    sc->ttml_paragraphs = 1;
+    sc->ttml_last_pts   = AV_NOPTS_VALUE;
+
+    if (!(sc->pb->seekable & AVIO_SEEKABLE_NORMAL) || !sti->nb_index_entries)
+        return 0;
+
+    if ((saved = avio_tell(sc->pb)) < 0)
+        return 0;
+
+    /* documents without a head, e.g. from an empty fragment, tell nothing
+     * about the styles, so look for one that has it */
+    for (int i = 0; i < FFMIN(sti->nb_index_entries, MOV_TTML_PROBE_SAMPLES) &&
+                    !have_head; i++) {
+        const AVIndexEntry *e = &sti->index_entries[i];
+        uint8_t *buf;
+
+        if (e->size <= 0 || e->size > MOV_TTML_MAX_SAMPLE_SIZE ||
+            avio_seek(sc->pb, e->pos, SEEK_SET) != e->pos)
+            continue;
+        if (!(buf = av_malloc(e->size))) {
+            ret = AVERROR(ENOMEM);
+            break;
+        }
+        if (avio_read(sc->pb, buf, e->size) == e->size) {
+            if (!(par = avcodec_parameters_alloc())) {
+                ret = AVERROR(ENOMEM);
+            } else if (ff_ttml_parse(s, buf, e->size, par, &md, NULL, NULL) >= 0) {
+                have_head = mov_ttml_has_head(par);
+                if (!first || have_head) {
+                    avcodec_parameters_free(&first);
+                    first = par;
+                    par   = NULL;
+                }
+            }
+            avcodec_parameters_free(&par);
+        }
+        av_free(buf);
+        if (ret < 0)
+            break;
+    }
+
+    if (avio_seek(sc->pb, saved, SEEK_SET) != saved && ret >= 0)
+        ret = AVERROR(EIO);
+
+    if (ret >= 0 && first) {
+        av_freep(&st->codecpar->extradata);
+        st->codecpar->extradata      = first->extradata;
+        st->codecpar->extradata_size = first->extradata_size;
+        first->extradata      = NULL;
+        first->extradata_size = 0;
+        if (!av_dict_get(st->metadata, "language", NULL, 0) ||
+            !strcmp(av_dict_get(st->metadata, "language", NULL, 0)->value, "und")) {
+            const AVDictionaryEntry *lang = av_dict_get(md, "language", NULL, 0);
+            if (lang)
+                av_dict_set(&st->metadata, "language", lang->value, 0);
+        }
+    }
+    avcodec_parameters_free(&first);
+    av_dict_free(&md);
+    return ret;
+}
+#endif /* CONFIG_LIBXML2 */
+
 static int mov_read_header(AVFormatContext *s)
 {
     MOVContext *mov = s->priv_data;
@@ -11162,6 +11426,17 @@ static int mov_read_header(AVFormatContext *s)
             break;
         }
     }
+
+#if CONFIG_LIBXML2
+    for (i = 0; i < s->nb_streams; i++) {
+        AVStream *st = s->streams[i];
+
+        if (st->codecpar->codec_id == AV_CODEC_ID_TTML &&
+            st->codecpar->codec_tag == MOV_MP4_TTML_TAG &&
+            (err = mov_ttml_probe_stream(s, st)) < 0)
+            return err;
+    }
+#endif
 
     fix_stream_ids(s);
 
@@ -11632,6 +11907,28 @@ static int mov_finalize_packet(AVFormatContext *s, AVStream *st, AVIndexEntry *s
     return 0;
 }
 
+/* At the end of the file, emit the text that is held back. Returns
+ * FFERROR_REDO if there was some, else AVERROR_EOF. */
+static int mov_flush_text_streams(AVFormatContext *s)
+{
+    int nb_buffered = 0, ret;
+
+    for (int i = 0; i < s->nb_streams; i++) {
+        MOVStreamContext *msc = s->streams[i]->priv_data;
+        if (msc && msc->nb_wvtt_cues &&
+            (ret = mov_wvtt_flush_cues(s, s->streams[i], 1, &nb_buffered)) < 0)
+            return ret;
+#if CONFIG_LIBXML2
+        if (msc && msc->nb_ttml_held) {
+            nb_buffered += msc->nb_ttml_held;
+            if ((ret = mov_ttml_flush_held(s, msc, 0, 1)) < 0)
+                return ret;
+        }
+#endif
+    }
+    return nb_buffered ? FFERROR_REDO : AVERROR_EOF;
+}
+
 static int mov_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     MOVContext *mov = s->priv_data;
@@ -11680,17 +11977,13 @@ static int mov_read_packet(AVFormatContext *s, AVPacket *pkt)
     }
     sample = mov_find_next_sample(s, &st);
     if (!sample || (mov->next_root_atom && sample->pos > mov->next_root_atom)) {
-        if (!mov->next_root_atom) {
-            int nb_buffered = 0;
-            for (i = 0; i < s->nb_streams; i++) {
-                MOVStreamContext *msc = s->streams[i]->priv_data;
-                if (msc && msc->nb_wvtt_cues &&
-                    (ret = mov_wvtt_flush_cues(s, s->streams[i], 1, &nb_buffered)) < 0)
-                    return ret;
-            }
-            return nb_buffered ? FFERROR_REDO : AVERROR_EOF;
-        }
-        if ((ret = mov_switch_root(s, mov->next_root_atom, -1)) < 0)
+        if (!mov->next_root_atom)
+            return mov_flush_text_streams(s);
+        ret = mov_switch_root(s, mov->next_root_atom, -1);
+        /* the last fragment has been read, drain what is held back */
+        if (ret == AVERROR_EOF)
+            return mov_flush_text_streams(s);
+        if (ret < 0)
             return ret;
         goto retry;
     }
@@ -11754,6 +12047,36 @@ static int mov_read_packet(AVFormatContext *s, AVPacket *pkt)
                 return ret;
             return FFERROR_REDO;
         }
+#if CONFIG_LIBXML2
+        else if (sc->ttml_paragraphs) {
+            uint8_t *buf;
+            int64_t end;
+
+            if (sample->size < 0 || sample->size > MOV_TTML_MAX_SAMPLE_SIZE ||
+                !(buf = av_malloc(sample->size)))
+                return AVERROR(ENOMEM);
+            ret = avio_read(sc->pb, buf, sample->size);
+            if (ret != sample->size) {
+                av_free(buf);
+                if (ret >= 0)
+                    ret = AVERROR_INVALIDDATA;
+                if (should_retry(sc->pb, ret))
+                    mov_current_sample_dec(sc);
+                return ret;
+            }
+            av_packet_unref(pkt);
+            ret = mov_finalize_packet(s, st, sample, current_index, pkt);
+            end = pkt->pts + pkt->duration;
+            av_packet_unref(pkt);
+            if (ret >= 0)
+                ret = mov_ttml_parse_sample(s, st, buf, sample->size, end,
+                                            sample->pos);
+            av_free(buf);
+            if (ret < 0)
+                return ret;
+            return FFERROR_REDO;
+        }
+#endif
 #if CONFIG_IAMFDEC
         else if (sc->iamf) {
             int64_t pts, dts, pos, duration;
@@ -12023,6 +12346,8 @@ static int mov_read_seek(AVFormatContext *s, int stream_index, int64_t sample_ti
     for (i = 0; i < s->nb_streams; i++) {
         MOVStreamContext *sc = s->streams[i]->priv_data;
         mov_wvtt_clear_cues(sc);
+        sc->ttml_last_pts = AV_NOPTS_VALUE;
+        mov_ttml_clear_held(sc);
     }
 
     if (mc->seek_individually) {
