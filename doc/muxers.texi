@@ -2184,6 +2184,13 @@ Output segment files in fragmented MP4 format, similar to MPEG-DASH.
 fmp4 files may be used in HLS version 7 and above.
 @end table
 
+TTML subtitle streams are only supported with @samp{fmp4}. They are carried as
+@code{stpp} (IMSC1 text profile) in the fragmented MP4 segments of a variant
+stream of their own, which has to hold nothing but TTML streams, while WebVTT
+subtitles are always written as @file{.vtt} segments. The @code{CODECS}
+attribute of the variant streams that use the subtitle group includes
+@code{stpp.ttml.im1t}.
+
 @item hls_fmp4_init_filename @var{filename}
 Set filename for the fragment files header file, default filename is @file{init.mp4}.
 
@@ -2400,6 +2407,10 @@ audio/stream-0/stream-0.m3u8
 @item sgroup:@var{str}
 Associates this variant with a subtitle rendition group. Behaves analogously
 to @option{agroup:} for subtitles.
+For a TTML subtitle-only variant stream the group is advertised with its media
+playlist, which lists an @code{EXT-X-MAP} initialization section and @code{.m4s}
+segments, and the @code{CODECS} attribute of the video variant streams that
+reference the group is extended with the @code{stpp} codec string.
 
 @item default:yes|no
 Sets the @code{DEFAULT=} attribute for the rendition.

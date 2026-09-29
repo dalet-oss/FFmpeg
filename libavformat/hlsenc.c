@@ -134,7 +134,8 @@ typedef struct VariantStream {
     AVFormatContext *vtt_avf;
 
     int has_video;
-    int has_subtitle;
+    int has_subtitle;   /* any subtitle stream */
+    int has_vtt;        /* subtitle streams muxed by vtt_avf, i.e. not TTML */
     int new_start;
     int start_pts_from_audio;
     double dpp;           // duration per packet
@@ -281,6 +282,13 @@ typedef enum {
     HLS_STREAM_AUDIO    = 1,
     HLS_STREAM_SUBTITLE = 2,
 } HLSStreamType;
+
+/* WebVTT is muxed into its own file by vtt_avf, TTML goes to the mp4 muxer as stpp */
+static inline int is_vtt_stream(const AVCodecParameters *par)
+{
+    return par->codec_type == AVMEDIA_TYPE_SUBTITLE &&
+           par->codec_id != AV_CODEC_ID_TTML;
+}
 
 static inline HLSStreamType vs_stream_type(const VariantStream *vs)
 {
@@ -659,7 +667,7 @@ static void write_codec_attr(AVStream *st, VariantStream *vs)
     char attr[32];
     AVBPrint buffer;
 
-    if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
+    if (is_vtt_stream(st->codecpar))
         return;
     if (vs->attr_status == CODEC_ATTRIBUTE_WILL_NOT_BE_WRITTEN)
         return;
@@ -1062,7 +1070,7 @@ static int hls_mux_init(AVFormatContext *s, VariantStream *vs)
     for (i = 0; i < vs->nb_streams; i++) {
         AVStream *st;
         AVFormatContext *loc;
-        if (vs->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE)
+        if (is_vtt_stream(vs->streams[i]->codecpar))
             loc = vtt_oc;
         else
             loc = oc;
@@ -1089,7 +1097,7 @@ static int hls_mux_init(AVFormatContext *s, VariantStream *vs)
     vs->start_pos = 0;
     vs->new_start = 1;
 
-    /* subtitle-only variant: all streams go to vtt_avf, main container is unused */
+    /* WebVTT-only variant: all streams go to vtt_avf, main container is unused */
     if (oc->nb_streams == 0)
         return 0;
 
@@ -1331,7 +1339,7 @@ static int hls_append_segment(struct AVFormatContext *s, HLSContext *hls,
     }
     av_strlcpy(en->filename, filename, sizeof(en->filename));
 
-    if (vs->has_subtitle)
+    if (vs->has_vtt)
         av_strlcpy(en->sub_filename, av_basename(vs->vtt_avf->url), sizeof(en->sub_filename));
     else
         en->sub_filename[0] = '\0';
@@ -1498,7 +1506,7 @@ static int parse_playlist(AVFormatContext *s, const char *url, VariantStream *vs
                 }
                 ff_format_set_url(vs->avf, new_file);
 
-                if (vs->has_subtitle) {
+                if (vs->has_vtt) {
                     int vtt_index = extract_segment_number(line);
                     const char *vtt_basename = av_basename(vs->vtt_basename);
                     char *vtt_file = NULL;
@@ -1898,7 +1906,8 @@ static int hls_window(AVFormatContext *s, int last, VariantStream *vs)
         }
 
         {
-            int subtitle_only = vs->has_subtitle && !vs->has_video;
+            /* a WebVTT only variant has no init section, a TTML one is an mp4 like any other */
+            int subtitle_only = vs->has_vtt && !vs->has_video;
             if ((hls->segment_type == SEGMENT_TYPE_FMP4) && (en == vs->segments) && !subtitle_only) {
                 ff_hls_write_init_file(byterange_mode ? hls->m3u8_out : vs->out, (hls->flags & HLS_SINGLE_FILE) ? en->filename : vs->fmp4_init_filename,
                                        hls->flags & HLS_SINGLE_FILE, vs->init_range_length, 0);
@@ -2016,6 +2025,20 @@ static void hls_write_active_cues(AVFormatContext *s, VariantStream *vs)
     vs->active_cues = keep;
 
     av_packet_free(&cue);
+}
+
+/* A TTML only variant has no other track to time its fragments, so declare the
+ * window of the segment about to be flushed to the mp4 muxer. */
+static void hls_set_frag_window(VariantStream *vs, int64_t start, int64_t end,
+                                AVRational tb)
+{
+    if (!vs->has_subtitle || vs->has_vtt || vs->avf->nb_streams == 0 ||
+        start == AV_NOPTS_VALUE)
+        return;
+    av_opt_set_int(vs->avf->priv_data, "frag_start_pts",
+                   av_rescale_q(start, tb, AV_TIME_BASE_Q), 0);
+    av_opt_set_int(vs->avf->priv_data, "frag_end_pts",
+                   av_rescale_q(end, tb, AV_TIME_BASE_Q), 0);
 }
 
 static int hls_start(AVFormatContext *s, VariantStream *vs)
@@ -2620,7 +2643,7 @@ static int hls_write_header(AVFormatContext *s)
     VariantStream *vs = NULL;
 
     for (i = 0; i < hls->nb_varstreams; i++) {
-        int subtitle_streams = 0;
+        int vtt_streams = 0;
         vs = &hls->var_streams[i];
 
         if (vs->avf->nb_streams > 0) {
@@ -2642,11 +2665,11 @@ static int hls_write_header(AVFormatContext *s)
                 }
             }
 
-            if (outer_st->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE)
-                inner_st = vs->avf->streams[j - subtitle_streams];
+            if (!is_vtt_stream(outer_st->codecpar))
+                inner_st = vs->avf->streams[j - vtt_streams];
             else if (vs->vtt_avf) {
                 inner_st = vs->vtt_avf->streams[0];
-                subtitle_streams++;
+                vtt_streams++;
             } else {
                 /* We have a subtitle stream, when the user does not want one */
                 inner_st = NULL;
@@ -2668,6 +2691,17 @@ static int hls_write_header(AVFormatContext *s)
                     vs_agroup->agroup &&
                     !av_strcasecmp(vs_agroup->agroup, vs->agroup)) {
                     write_codec_attr(vs_agroup->streams[0], vs);
+                }
+            }
+        }
+        /* Same for the TTML (stpp) renditions of the mapped subtitle group */
+        if (vs->has_video && vs->sgroup) {
+            for (j = 0; j < hls->nb_varstreams; j++) {
+                VariantStream *vs_sgroup = &(hls->var_streams[j]);
+                if (!vs_sgroup->has_video && vs_sgroup->has_subtitle && !vs_sgroup->has_vtt &&
+                    vs_sgroup->sgroup &&
+                    !av_strcasecmp(vs_sgroup->sgroup, vs->sgroup)) {
+                    write_codec_attr(vs_sgroup->streams[0], vs);
                 }
             }
         }
@@ -2740,19 +2774,19 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
     char *old_filename = NULL;
 
     for (i = 0; i < hls->nb_varstreams; i++) {
-        int subtitle_streams = 0;
+        int vtt_streams = 0;
         vs = &hls->var_streams[i];
         for (j = 0; j < vs->nb_streams; j++) {
-            if (vs->streams[j]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
-                subtitle_streams++;
+            if (is_vtt_stream(vs->streams[j]->codecpar)) {
+                vtt_streams++;
             }
             if (vs->streams[j] == st) {
-                if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+                if (is_vtt_stream(st->codecpar)) {
                     oc = vs->vtt_avf;
                     stream_index = 0;
                 } else {
                     oc = vs->avf;
-                    stream_index = j - subtitle_streams;
+                    stream_index = j - vtt_streams;
                 }
                 break;
             }
@@ -2779,6 +2813,10 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
 
     if (vs->start_pts == AV_NOPTS_VALUE) {
         vs->start_pts = pkt->pts;
+        /* a TTML variant is timed by its cues alone, but its media timeline has to
+         * start where the one of the other variants does: at zero, not at its first cue */
+        if (vs->has_subtitle && !vs->has_vtt && pkt->pts > 0)
+            vs->start_pts = 0;
         if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
             vs->start_pts_from_audio = 1;
     }
@@ -2797,7 +2835,8 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
 
     if (is_ref_pkt) {
         if (vs->end_pts == AV_NOPTS_VALUE)
-            vs->end_pts = pkt->pts;
+            vs->end_pts = vs->start_pts != AV_NOPTS_VALUE && vs->has_subtitle && !vs->has_vtt ?
+                          vs->start_pts : pkt->pts;
         if (vs->new_start) {
             vs->new_start = 0;
             vs->duration = (double)(pkt->pts - vs->end_pts)
@@ -2821,6 +2860,7 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
         int byterange_mode = (hls->flags & HLS_SINGLE_FILE) || (hls->max_seg_size > 0);
         double cur_duration;
 
+        hls_set_frag_window(vs, vs->end_pts, pkt->pts, st->time_base);
         av_write_frame(oc, NULL); /* Flush any buffered data */
         new_start_pos = avio_tell(oc->pb);
         vs->size = new_start_pos - vs->start_pos;
@@ -3007,7 +3047,7 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
         return AVERROR_BUG;
     }
     if (oc->pb) {
-        if (st->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE &&
+        if (is_vtt_stream(st->codecpar) &&
             (ret = hls_keep_cue(s, vs, st, pkt)) < 0)
             return ret;
         ret = ff_write_chained(oc, stream_index, pkt, s, 0);
@@ -3095,6 +3135,14 @@ static int hls_write_trailer(struct AVFormatContext *s)
             av_dict_free(&options);
             av_freep(&old_filename);
             return AVERROR(ENOMEM);
+        }
+
+        if (vs->nb_streams) {
+            /* the end of the last segment, as the playlist is about to state it */
+            AVRational tb = vs->streams[0]->time_base;
+            hls_set_frag_window(vs, vs->end_pts,
+                                vs->end_pts + av_rescale_q((int64_t)((vs->duration + vs->dpp) * AV_TIME_BASE),
+                                                           AV_TIME_BASE_Q, tb), tb);
         }
 
         if (hls->segment_type == SEGMENT_TYPE_FMP4 && vs->avf->nb_streams > 0) {
@@ -3321,6 +3369,21 @@ static int hls_init(AVFormatContext *s)
                 vs->reference_stream_index = vs->streams[j]->index;
             }
             vs->has_subtitle += vs->streams[j]->codecpar->codec_type == AVMEDIA_TYPE_SUBTITLE;
+            vs->has_vtt      += is_vtt_stream(vs->streams[j]->codecpar);
+        }
+
+        if (vs->has_subtitle > vs->has_vtt) {
+            int ttml_only = vs->has_subtitle == vs->nb_streams && !vs->has_vtt;
+            if (hls->segment_type != SEGMENT_TYPE_FMP4) {
+                av_log(s, AV_LOG_ERROR, "TTML subtitles are carried as stpp in fragmented mp4, "
+                       "use -hls_segment_type fmp4\n");
+                return AVERROR(EINVAL);
+            }
+            if (!ttml_only) {
+                av_log(s, AV_LOG_ERROR, "TTML subtitles must be the only streams of their "
+                       "variant stream, they cannot be mixed with other streams\n");
+                return AVERROR(EINVAL);
+            }
         }
 
         ret = expand_template(s->url, &vs->m3u8_name, vs);
@@ -3429,7 +3492,7 @@ static int hls_init(AVFormatContext *s)
         if (ret < 0)
             return ret;
 
-        if (vs->has_subtitle) {
+        if (vs->has_vtt) {
             EXTERN const FFOutputFormat ff_webvtt_muxer;
             vs->vtt_oformat = &ff_webvtt_muxer.p;
 
