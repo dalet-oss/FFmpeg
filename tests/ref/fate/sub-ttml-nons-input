@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?><tt ttp:frameRate="30" ttp:frameRateMultiplier="1000 1001" ttp:timeBase="media" xml:lang="en" xmlns:tts="http://www.w3.org/ns/ttml#styling" xmlns:ttp="http://www.w3.org/ns/ttml#parameter">
+  <head>
+    <styling>
+      <style tts:color="white" xml:id="basic"/>
+    </styling>
+    <layout>
+      <region tts:origin="10% 90%" tts:extent="80% 10%" xml:id="pop1"/>
+    </layout>
+  </head>
+  <body>
+    <div xml:lang="en">
+      <p begin="00:00:01:00" end="00:00:02:15" region="pop1" style="basic">First<br/>line</p>
+      <p begin="00:00:03:00" end="00:00:04:00" region="pop1" style="basic"><span tts:color="red">Second</span></p>
+    </div>
+  </body>
+</tt>
