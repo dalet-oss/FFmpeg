@@ -1182,9 +1182,14 @@ the dash segment files will be in WebM format
 @end table
 
 This option only applies to audio and video streams. WebVTT subtitle
-streams (@code{AV_CODEC_ID_WEBVTT}) are always muxed as a single raw
-WebVTT file per representation, with @code{mimeType="text/vtt"}, and
-require @option{single_file} to be enabled.
+streams (@code{AV_CODEC_ID_WEBVTT}) are muxed as a single raw WebVTT file
+per representation, with @code{mimeType="text/vtt"}, when
+@option{single_file} is enabled. TTML subtitle streams
+(@code{AV_CODEC_ID_TTML}) likewise become a single TTML document per
+representation, with @code{mimeType="application/ttml+xml"}. When
+@option{single_file} is disabled, both are carried as ISO/IEC 14496-30 text
+tracks (@code{wvtt}, respectively @code{stpp.ttml.im1t}) in the regular mp4
+segments, one segment per segment of the presentation.
 
 @item extra_window_size @var{size}
 Set the maximum number of segments kept outside of the manifest before
