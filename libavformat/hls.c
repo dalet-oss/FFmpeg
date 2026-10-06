@@ -935,6 +935,13 @@ static int parse_playlist(HLSContext *c, const char *url,
             if (ret < 0)
                 goto fail;
             ff_parse_key_value(ptr, handle_init_section_args, &info);
+            /* An init section means the segments are fragmented MP4, not raw
+             * WebVTT text, so a SUBTITLES rendition (e.g. IMSC1 stpp) is read
+             * like any other rendition. */
+            if (pls->is_subtitle) {
+                pls->is_subtitle = 0;
+                pls->is_id3_timestamped = -1;
+            }
             cur_init_section = new_init_section(pls, &info, url);
             if (!cur_init_section) {
                 ret = AVERROR(ENOMEM);
