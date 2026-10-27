@@ -125,6 +125,7 @@ struct representation {
     uint32_t init_sec_buf_read_offset;
     int64_t cur_timestamp;
     int is_restart_needed;
+    int eof; /* all fragments were read, until the next seek */
 };
 
 typedef struct DASHContext {
@@ -2392,7 +2393,7 @@ static void recheck_discard_flags(AVFormatContext *s, struct representation **p,
         for (int j = 0; j < pls->nb_assoc_stream; j++)
             needed |= pls->assoc_stream[j]->discard < AVDISCARD_ALL;
 
-        if (needed && !pls->ctx) {
+        if (needed && !pls->ctx && !pls->eof) {
             pls->cur_seg_offset = 0;
             pls->init_sec_buf_read_offset = 0;
             /* Catch up */
@@ -2471,9 +2472,7 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
             close_demux_for_component(cur);
             ff_format_io_close(cur->parent, &cur->input);
             av_log(s, AV_LOG_DEBUG, "EOF on stream_index %d\n", cur->stream_index);
-            // prevent recheck_discard_flags() from re-enabling the component
-            for (int i = 0; i < cur->nb_assoc_stream; i++)
-                cur->assoc_stream[i]->discard = AVDISCARD_ALL;
+            cur->eof = 1;
             return FFERROR_REDO;
         }
     }
@@ -2500,6 +2499,8 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
 
     av_log(pls->parent, AV_LOG_VERBOSE, "DASH seek pos[%"PRId64"ms] %s\n",
            seek_pos_msec, dry_run ? " (dry)" : "");
+
+    pls->eof = 0;
 
     // single fragment mode
     if (pls->n_fragments == 1) {
