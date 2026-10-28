@@ -263,6 +263,11 @@ fate-aac-yoraw-encode: REF = $(SAMPLES)/audio-reference/yo.raw-short.wav
 fate-aac-yoraw-encode: CMP_TARGET = 226
 fate-aac-yoraw-encode: FUZZ = 17
 
+# 16 channel hexadecagonal layout, signaled with a PCE; checks the PCE bits
+FATE_AAC_PCE_ENCODE-$(call ALLYES, LAVFI_INDEV ANULLSRC_FILTER AAC_ENCODER MP4_MUXER \
+                                   MOV_DEMUXER AAC_DECODER FILE_PROTOCOL) += fate-aac-pce-16ch-encode
+fate-aac-pce-16ch-encode: CMD = run_with_temp "$(FFMPEG) -nostdin -hide_banner -loglevel error -f lavfi -i anullsrc=r=48000:cl=hexadecagonal -t 0.1 -c:a aac -fflags +bitexact -flags +bitexact -f mp4 -y" "ffprobe$(PROGSSUF)$(EXESUF) -bitexact -show_entries stream=codec_name,channels,channel_layout,extradata_size,extradata_hash -show_data_hash CRC32 -of compact=p=0" mp4
+
 FATE_AAC_LATM += fate-aac-latm_000000001180bc60
 fate-aac-latm_000000001180bc60: CMD = pcm -i $(TARGET_SAMPLES)/aac/latm_000000001180bc60.mpg
 fate-aac-latm_000000001180bc60: REF = $(SAMPLES)/aac/latm_000000001180bc60.s16
@@ -289,6 +294,7 @@ FATE_AAC_ENCODE-$(call TRANSCODE, AAC, MP4 MOV, WAV_MUXER WAV_DEMUXER PCM_S16LE_
 FATE_AAC_BSF-$(call FRAMECRC, AAC MATROSKA, AAC, AAC_PARSER AAC_ADTSTOASC_BSF MATROSKA_MUXER) += fate-aac-autobsf-adtstoasc
 
 FATE_SAMPLES_FFMPEG += $(FATE_AAC_ALL) $(FATE_AAC_ENCODE-yes) $(FATE_AAC_BSF-yes)
+FATE_FFMPEG_FFPROBE += $(FATE_AAC_PCE_ENCODE-yes)
 
-fate-aac: $(FATE_AAC_ALL) $(FATE_AAC_ENCODE-yes) $(FATE_AAC_BSF-yes)
+fate-aac: $(FATE_AAC_ALL) $(FATE_AAC_ENCODE-yes) $(FATE_AAC_BSF-yes) $(FATE_AAC_PCE_ENCODE-yes)
 fate-aac-latm: $(FATE_AAC_LATM-yes)
