@@ -296,6 +296,17 @@ static const AACPCEInfo aac_pce_configs[] = {
         .config_map = { 5, TYPE_SCE, TYPE_CPE, TYPE_CPE, TYPE_CPE, TYPE_SCE },
         .reorder_map = { 2, 0, 1, 6, 7, 3, 4, 5 },
     },
+    {   /* Keeps the native channel order as coded order, as n8.1.3 did, so
+         * decoders return the tracks in input order. The pairs do not match
+         * speaker positions; there is no height signaling. */
+        .layout = AV_CHANNEL_LAYOUT_HEXADECAGONAL,
+        .num_ele = { 4, 0, 4, 0 },
+        .pairing = { { 1, 1, 1, 1 }, { 0 }, { 1, 1, 1, 1 }, },
+        .index = { { 0, 1, 2, 3 }, { 0 }, { 4, 5, 6, 7 }, },
+        .config_map = { 8, TYPE_CPE, TYPE_CPE, TYPE_CPE, TYPE_CPE,
+                           TYPE_CPE, TYPE_CPE, TYPE_CPE, TYPE_CPE },
+        .reorder_map = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
+    },
 };
 
 static void put_pce(PutBitContext *pb, AVCodecContext *avctx)
