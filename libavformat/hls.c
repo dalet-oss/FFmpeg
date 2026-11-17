@@ -2123,7 +2123,11 @@ static void add_metadata_from_renditions(AVFormatContext *s, struct playlist *pl
             if (rend->name[0])
                 av_dict_set(&st->metadata, "comment", rend->name, 0);
 
-            st->disposition |= rend->disposition;
+            /* DEFAULT comes from the manifest's DEFAULT attribute; the one
+             * inherited from the segment demuxer (e.g. every enabled mp4
+             * track) would mark every rendition default */
+            st->disposition = (st->disposition & ~AV_DISPOSITION_DEFAULT) |
+                              rend->disposition;
         }
         if (rend_idx >=pls->n_renditions)
             break;
@@ -2970,6 +2974,8 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
             if (ret < 0) {
                 return ret;
             }
+            /* the copy above replaced the rendition's disposition */
+            add_metadata_from_renditions(s, pls, st->codecpar->codec_type);
         }
 
         return 0;
