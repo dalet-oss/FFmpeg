@@ -2103,8 +2103,17 @@ static void add_renditions_to_variant(HLSContext *c, struct variant *var,
 static void add_metadata_from_renditions(AVFormatContext *s, struct playlist *pls,
                                          enum AVMediaType type)
 {
+    HLSContext *c = s->priv_data;
     int rend_idx = 0;
+    int keep_default = 1;
     int i;
+
+    /* when no rendition of this type has DEFAULT=YES, keep the DEFAULT
+     * inherited from the segment demuxer */
+    for (i = 0; i < c->n_renditions; i++)
+        if (c->renditions[i]->type == type &&
+            c->renditions[i]->disposition & AV_DISPOSITION_DEFAULT)
+            keep_default = 0;
 
     for (i = 0; i < pls->n_main_streams; i++) {
         AVStream *st = pls->main_streams[i];
@@ -2123,7 +2132,14 @@ static void add_metadata_from_renditions(AVFormatContext *s, struct playlist *pl
             if (rend->name[0])
                 av_dict_set(&st->metadata, "comment", rend->name, 0);
 
-            st->disposition |= rend->disposition;
+            /* DEFAULT comes from the manifest's DEFAULT attribute; the one
+             * inherited from the segment demuxer (e.g. every enabled mp4
+             * track) would mark every rendition default */
+            if (keep_default)
+                st->disposition |= rend->disposition;
+            else
+                st->disposition = (st->disposition & ~AV_DISPOSITION_DEFAULT) |
+                                  rend->disposition;
         }
         if (rend_idx >=pls->n_renditions)
             break;
@@ -2970,6 +2986,8 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
             if (ret < 0) {
                 return ret;
             }
+            /* the copy above replaced the rendition's disposition */
+            add_metadata_from_renditions(s, pls, st->codecpar->codec_type);
         }
 
         return 0;
