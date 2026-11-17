@@ -89,6 +89,8 @@ struct representation {
     char *id;
     char *lang;
     char *label;
+    int role_main;
+    int keep_default; /* keep the DEFAULT inherited from the segment demuxer */
     int bandwidth;
     char *dependencyid;
     char *codecs;
@@ -155,6 +157,7 @@ typedef struct DASHContext {
 
     /* AdaptationSet Attribute */
     char *adaptionset_lang;
+    int adaptionset_role_main;
 
     int is_live;
     AVIOInterruptCB *interrupt_callback;
@@ -981,6 +984,7 @@ static int parse_manifest_representation(AVFormatContext *s, const char *url,
             return AVERROR(ENOMEM);
         }
     }
+    rep->role_main = c->adaptionset_role_main;
     rep->parent = s;
     representation_segmenttemplate_node = find_child_node_by_name(representation_node, "SegmentTemplate");
     representation_baseurl_node = find_child_node_by_name(representation_node, "BaseURL");
@@ -1207,12 +1211,28 @@ free:
 static int parse_manifest_adaptationset_attr(AVFormatContext *s, xmlNodePtr adaptionset_node)
 {
     DASHContext *c = s->priv_data;
+    xmlNodePtr node;
 
     if (!adaptionset_node) {
         av_log(s, AV_LOG_WARNING, "Cannot get AdaptionSet\n");
         return AVERROR(EINVAL);
     }
     c->adaptionset_lang = xmlGetProp(adaptionset_node, "lang");
+
+    c->adaptionset_role_main = 0;
+    for (node = xmlFirstElementChild(adaptionset_node); node; node = xmlNextElementSibling(node)) {
+        char *scheme, *value;
+
+        if (av_strcasecmp(node->name, "Role"))
+            continue;
+        scheme = xmlGetProp(node, "schemeIdUri");
+        value  = xmlGetProp(node, "value");
+        if (scheme && value && !strcmp(scheme, "urn:mpeg:dash:role:2011") &&
+            !strcmp(value, "main"))
+            c->adaptionset_role_main = 1;
+        xmlFree(scheme);
+        xmlFree(value);
+    }
 
     return 0;
 }
@@ -2114,8 +2134,13 @@ static int open_demux_for_component(AVFormatContext *s, struct representation *p
 
         avpriv_set_pts_info(st, ist->pts_wrap_bits, ist->time_base.num, ist->time_base.den);
 
-        // copy disposition
+        /* DEFAULT comes from the manifest's Role "main"; the one inherited
+         * from the segment demuxer (e.g. every enabled mp4 track) would mark
+         * every representation default */
         st->disposition = ist->disposition;
+        if (!pls->keep_default)
+            st->disposition = (st->disposition & ~AV_DISPOSITION_DEFAULT) |
+                              (pls->role_main ? AV_DISPOSITION_DEFAULT : 0);
         sti->need_parsing = isti->need_parsing;
     }
 
@@ -2210,6 +2235,19 @@ static void move_metadata(AVStream *st, const char *key, char **value)
     }
 }
 
+/* when no AdaptationSet of a type has Role "main", the representations of
+ * that type keep the DEFAULT inherited from the segment demuxer */
+static void keep_default_without_role_main(struct representation **reps, int n)
+{
+    int i;
+
+    for (i = 0; i < n && !reps[i]->role_main; i++)
+        ;
+    if (i == n)
+        for (i = 0; i < n; i++)
+            reps[i]->keep_default = 1;
+}
+
 static int dash_read_header(AVFormatContext *s)
 {
     DASHContext *c = s->priv_data;
@@ -2237,6 +2275,10 @@ static int dash_read_header(AVFormatContext *s)
 
     if(c->n_videos)
         c->is_init_section_common_video = is_common_init_section_exist(c->videos, c->n_videos);
+
+    keep_default_without_role_main(c->videos, c->n_videos);
+    keep_default_without_role_main(c->audios, c->n_audios);
+    keep_default_without_role_main(c->subtitles, c->n_subtitles);
 
     /* Open the demuxer for video and audio components if available */
     for (i = 0; i < c->n_videos; i++) {
