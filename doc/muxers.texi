@@ -1270,6 +1270,25 @@ DASH-templated name to use for the initialization segment. Default is
 @code{init-stream$RepresentationID$.$ext$}. @code{$ext$} is replaced
 with the file name extension specific for the segment format.
 
+The @option{init_seg_name}, @option{media_seg_name} and
+@option{single_file_name} templates also accept per stream type
+blocks @code{%[v:@var{tmpl}|a:@var{tmpl}|s:@var{tmpl}]}: the branch
+matching the stream (video, audio or subtitle) is used, and a stream
+without a matching branch gets an empty string. @code{%@{name@}} is
+replaced with the stream's @code{dash_name} metadata value, or with the
+stream index if it is not set, and @code{%%} gives a literal @code{%}.
+These are resolved for each stream before @code{$ext$} and the DASH
+identifiers, which can be used inside a branch. Directories in the
+resulting path are created for local file output. Templates without
+@code{%[} or @code{%@{} are used unchanged. For example:
+@example
+ffmpeg -i in.mkv -map 0 -metadata:s:v:0 dash_name=1280x720-3000k \
+  -metadata:s:a:0 dash_name=stream-1 \
+  -init_seg_name '%[v:video/%@{name@}/init.mp4|a:audio/%@{name@}/init.mp4]' \
+  -media_seg_name '%[v:video/%@{name@}/segment-$Number%05d$.m4s|a:audio/%@{name@}/segment-$Number%05d$.m4s]' \
+  manifest.mpd
+@end example
+
 @item ldash @var{bool}
 Enable Low-latency Dash by constraining the presence and values of
 some elements. This is disabled by default.

@@ -51,6 +51,7 @@
 #include "internal.h"
 #include "mux.h"
 #include "os_support.h"
+#include "pathtemplate.h"
 #include "url.h"
 #include "dash.h"
 
@@ -232,6 +233,21 @@ static int dashenc_io_open(AVFormatContext *s, AVIOContext **pb, char *filename,
 #endif
     }
     return err;
+}
+
+/* Creates the parent directory of path when writing to local files. */
+static int dashenc_mkdir_parent(AVFormatContext *s, const char *path)
+{
+    const char *proto = avio_find_protocol_name(s->url);
+    int ret;
+
+    if (!proto || strcmp(proto, "file"))
+        return 0;
+    av_strstart(path, "file:", &path);
+    ret = ff_path_template_mkdir_parent(path);
+    if (ret < 0)
+        av_log(s, AV_LOG_ERROR, "Unable to create the directory of '%s'\n", path);
+    return ret;
 }
 
 static int dashenc_io_close(AVFormatContext *s, AVIOContext **pb, char *filename) {
@@ -1391,6 +1407,64 @@ static int dict_copy_entry(AVDictionary **dst, const AVDictionary *src, const ch
     return 0;
 }
 
+typedef struct DASHTemplateStream {
+    const char *name;
+    int index;
+} DASHTemplateStream;
+
+static void dash_expand_named(const void *opaque, const char *name, int name_len,
+                              AVBPrint *buf)
+{
+    const DASHTemplateStream *ts = opaque;
+
+    if (name_len != 4 || strncmp(name, "name", 4))
+        return;
+    if (!ts->name) {
+        av_bprintf(buf, "%d", ts->index);
+        return;
+    }
+    /* '$' starts a DASH template identifier, so escape it as "$$" */
+    for (const char *c = ts->name; *c; c++)
+        av_bprint_chars(buf, *c, *c == '$' ? 2 : 1);
+}
+
+/* Selects the %[v:...|a:...|s:...] branch of tmpl for stream i and fills
+ * %{name} from its dash_name metadata, then replaces $ext$. Templates
+ * without %[ or %{ only get the $ext$ replacement. */
+static int dash_stream_template(AVFormatContext *s, OutputStream *os, int i,
+                                const char *tmpl, const char **out)
+{
+    char *expanded = NULL;
+
+    if (strstr(tmpl, "%[") || strstr(tmpl, "%{")) {
+        const AVStream *st = s->streams[i];
+        const AVDictionaryEntry *e = av_dict_get(st->metadata, "dash_name", NULL, 0);
+        DASHTemplateStream ts = { e ? e->value : NULL, i };
+        FFPathTemplateContext tc = {
+            .type         = FF_PATH_TEMPLATE_OTHER,
+            .opaque       = &ts,
+            .expand_named = dash_expand_named,
+        };
+        int ret;
+
+        switch (st->codecpar->codec_type) {
+        case AVMEDIA_TYPE_VIDEO:    tc.type = FF_PATH_TEMPLATE_VIDEO;    break;
+        case AVMEDIA_TYPE_AUDIO:    tc.type = FF_PATH_TEMPLATE_AUDIO;    break;
+        case AVMEDIA_TYPE_SUBTITLE: tc.type = FF_PATH_TEMPLATE_SUBTITLE; break;
+        default: break;
+        }
+        ret = ff_path_template_expand(tmpl, &expanded, &tc);
+        if (ret < 0) {
+            av_log(s, AV_LOG_ERROR, "Invalid file name template '%s'\n", tmpl);
+            return ret;
+        }
+        tmpl = expanded;
+    }
+    *out = av_strireplace(tmpl, "$ext$", os->extension_name);
+    av_free(expanded);
+    return *out ? 0 : AVERROR(ENOMEM);
+}
+
 static int dash_init(AVFormatContext *s)
 {
     DASHContext *c = s->priv_data;
@@ -1525,21 +1599,15 @@ static int dash_init(AVFormatContext *s)
         dict_copy_entry(&as->metadata, s->streams[i]->metadata, "language");
         dict_copy_entry(&as->metadata, s->streams[i]->metadata, "role");
 
-        if (c->init_seg_name) {
-            os->init_seg_name = av_strireplace(c->init_seg_name, "$ext$", os->extension_name);
-            if (!os->init_seg_name)
-                return AVERROR(ENOMEM);
-        }
-        if (c->media_seg_name) {
-            os->media_seg_name = av_strireplace(c->media_seg_name, "$ext$", os->extension_name);
-            if (!os->media_seg_name)
-                return AVERROR(ENOMEM);
-        }
-        if (c->single_file_name) {
-            os->single_file_name = av_strireplace(c->single_file_name, "$ext$", os->extension_name);
-            if (!os->single_file_name)
-                return AVERROR(ENOMEM);
-        }
+        if (c->init_seg_name &&
+            (ret = dash_stream_template(s, os, i, c->init_seg_name, &os->init_seg_name)) < 0)
+            return ret;
+        if (c->media_seg_name &&
+            (ret = dash_stream_template(s, os, i, c->media_seg_name, &os->media_seg_name)) < 0)
+            return ret;
+        if (c->single_file_name &&
+            (ret = dash_stream_template(s, os, i, c->single_file_name, &os->single_file_name)) < 0)
+            return ret;
 
         if (os->segment_type == SEGMENT_TYPE_WEBM) {
             if ((!c->single_file && !av_match_ext(os->init_seg_name, os->format_name))  ||
@@ -1600,6 +1668,8 @@ static int dash_init(AVFormatContext *s)
             ff_dash_fill_tmpl_params(os->initfile, sizeof(os->initfile), os->init_seg_name, i, 0, os->bit_rate, 0);
         }
         snprintf(filename, sizeof(filename), "%s%s", c->dirname, os->initfile);
+        if ((ret = dashenc_mkdir_parent(s, filename)) < 0)
+            return ret;
         set_http_options(&opts, c);
         if (!c->single_file) {
             if ((ret = avio_open_dyn_buf(&ctx->pb)) < 0) {
@@ -1967,6 +2037,8 @@ static int dashenc_start_segment(AVFormatContext *s, OutputStream *os,
              os->filename);
     snprintf(os->temp_path, sizeof(os->temp_path),
              use_rename ? "%s.tmp" : "%s", os->full_path);
+    if ((ret = dashenc_mkdir_parent(s, os->full_path)) < 0)
+        return ret;
     set_http_options(&opts, c);
     ret = dashenc_io_open(s, &os->out, os->temp_path, &opts);
     av_dict_free(&opts);
