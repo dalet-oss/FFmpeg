@@ -298,16 +298,21 @@ static inline HLSStreamType vs_stream_type(const VariantStream *vs)
     return HLS_STREAM_AUDIO;
 }
 
-static int has_any_template_placeholder(const char *s)
+static const char *find_template_placeholder(const char *s)
 {
-    if (!s) return 0;
+    if (!s) return NULL;
     for (; *s; s++) {
         if (s[0] == '%') {
             char c = s[1];
-            if (c == 'v' || c == '{' || c == '[') return 1;
+            if (c == 'v' || c == '{' || c == '[') return s;
         }
     }
-    return 0;
+    return NULL;
+}
+
+static int has_any_template_placeholder(const char *s)
+{
+    return !!find_template_placeholder(s);
 }
 
 static int validate_name(int nb_vs, const char *fn)
@@ -3322,7 +3327,7 @@ static int hls_init(AVFormatContext *s)
             if (seg_tmpl[0] != '/' && !strstr(seg_tmpl, "://")) {
                 /* relative template: resolve against output base dir derived from s->url */
                 const char *url = s->url;
-                const char *pct = strchr(url, '%');
+                const char *pct = find_template_placeholder(url);
                 const char *last_slash = NULL;
                 const char *q;
                 for (q = url; *q && q != pct; q++)
@@ -3364,14 +3369,14 @@ static int hls_init(AVFormatContext *s)
                     return AVERROR(ENOMEM);
                 av_strlcpy(vs->fmp4_init_filename, hls->fmp4_init_filename,
                            fmp4_init_filename_len);
-                if (hls->nb_varstreams > 1) {
-                    if (has_any_template_placeholder(vs->fmp4_init_filename)) {
-                        av_freep(&vs->fmp4_init_filename);
-                        ret = expand_template(hls->fmp4_init_filename,
-                                              &vs->fmp4_init_filename, vs);
-                    } else {
-                        ret = append_postfix(vs->fmp4_init_filename, fmp4_init_filename_len, i);
-                    }
+                if (has_any_template_placeholder(vs->fmp4_init_filename)) {
+                    av_freep(&vs->fmp4_init_filename);
+                    ret = expand_template(hls->fmp4_init_filename,
+                                          &vs->fmp4_init_filename, vs);
+                    if (ret < 0)
+                        return ret;
+                } else if (hls->nb_varstreams > 1) {
+                    ret = append_postfix(vs->fmp4_init_filename, fmp4_init_filename_len, i);
                     if (ret < 0)
                         return ret;
                 }
