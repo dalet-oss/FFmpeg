@@ -710,6 +710,7 @@ static void write_time(AVIOContext *out, int64_t time)
     int fractions = time % AV_TIME_BASE;
     int minutes = seconds / 60;
     int hours = minutes / 60;
+    char frac[7];
     seconds %= 60;
     minutes %= 60;
     avio_printf(out, "PT");
@@ -717,7 +718,10 @@ static void write_time(AVIOContext *out, int64_t time)
         avio_printf(out, "%dH", hours);
     if (hours || minutes)
         avio_printf(out, "%dM", minutes);
-    avio_printf(out, "%d.%dS", seconds, fractions / (AV_TIME_BASE / 10));
+    snprintf(frac, sizeof(frac), "%06d", fractions);
+    for (int i = 5; i > 0 && frac[i] == '0'; i--)
+        frac[i] = '\0';
+    avio_printf(out, "%d.%sS", seconds, frac);
 }
 
 static void format_date(char *buf, int size, int64_t time_us)
